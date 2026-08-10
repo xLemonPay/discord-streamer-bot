@@ -1,70 +1,33 @@
-# Discord Streamer Bot — versión Koyeb
+# Discord Streamer Bot v2
 
-Esta versión conserva las funciones del bot original y agrega un pequeño servidor HTTP:
+Novedades de esta versión:
 
-- `GET /`
-- `GET /health`
+- `🎭・roles`: canal dedicado para elegir país y rango de Valorant.
+- Migra/elimina el panel viejo de roles de `🤖・comandos` al ejecutar `/setup`.
+- `🎫 Soporte y reportes`: botón en `🤖・comandos`.
+- Cada reporte crea un canal privado visible solo para el usuario y el staff.
+- Botón para cerrar reportes.
+- `📋・reportes`: registra apertura/cierre de tickets.
+- `📜・logs`: entradas, salidas, cambios de roles/apodos, creación/eliminación de canales y roles.
+- Logs opcionales de mensajes editados/eliminados.
 
-El endpoint responde HTTP 200 mientras el proceso está vivo. Esto permite desplegar el bot
-como Web Service en Koyeb y monitorizarlo con un servicio de uptime.
+## IMPORTANTE: logs de mensajes
 
-## Funciones que se conservan
+Por seguridad, los logs del contenido de mensajes vienen apagados por defecto.
 
-- `/setup`
-- botón `✅ Verificarme`
-- asignación del rol `✅・Miembro`
-- selector visual de país
-- selector visual de rango de Valorant
-- salas temporales al entrar en `➕・Crear sala`
-- borrado automático de las salas temporales vacías
-- todos los roles, canales y permisos ya creados
+Para activarlos:
+1. Discord Developer Portal > tu aplicación > Bot.
+2. Activá `MESSAGE CONTENT INTENT`.
+3. En Northflank, agregá:
+   `ENABLE_MESSAGE_LOGS=true`
+4. Reiniciá/redeployá el servicio.
 
-No vuelvas a ejecutar `/setup` por obligación al migrar. El servidor de Discord ya conserva
-los canales, roles y permisos. Solo usalo si realmente querés que el bot vuelva a comprobar
-o actualizar la estructura.
+Si no activás esa variable, el resto del bot funciona normalmente.
 
-## Variables necesarias en Koyeb
+## Después de desplegar
 
-Creá estas variables en Koyeb:
+Esperá a que Northflank muestre el servicio como Running y ejecutá una sola vez:
 
-- `DISCORD_TOKEN` = token real del bot
-- `GUILD_ID` = ID real del servidor
+`/setup`
 
-NO subas `.env` a GitHub. `.gitignore` ya está preparado para ignorarlo.
-
-Koyeb proporciona `PORT` automáticamente a los Web Services, así que no hace falta crearlo.
-
-## Arranque
-
-El `Procfile` ya contiene:
-
-    web: python bot.py
-
-## Prueba local opcional
-
-Con tu `.env` local:
-
-    py -m pip install -r requirements.txt
-    py bot.py
-
-Después podés abrir:
-
-    http://127.0.0.1:8000/health
-
-## Migración PC -> Koyeb
-
-Podés dejar el bot local encendido mientras Koyeb está construyendo, pero cuando la instancia
-de Koyeb esté funcionando correctamente, cerrá el proceso local. No conviene mantener dos
-copias del mismo bot/token ejecutándose de forma permanente.
-
-## UptimeRobot
-
-Cuando Koyeb te entregue una URL pública como:
-
-    https://tu-app.koyeb.app
-
-creá un monitor HTTP(S) para:
-
-    https://tu-app.koyeb.app/health
-
-Un HTTP 200 indica que el proceso está vivo. El JSON además muestra `discord_ready`.
+No borra los canales/roles existentes. Crea o actualiza solamente lo necesario.
