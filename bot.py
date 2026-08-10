@@ -60,6 +60,13 @@ VALORANT_RANKS = [
     "🌟・Radiante",
 ]
 
+COUNTRY_REACTION_ROLES = {name.split("・", 1)[0]: name for name in COUNTRIES}
+RANK_REACTION_ROLES = {name.split("・", 1)[0]: name for name in VALORANT_RANKS}
+
+ROLE_PANEL_COUNTRY_TITLE = "🌎 Elegí tu país"
+ROLE_PANEL_RANK_TITLE = "🔫 Elegí tu rango de Valorant"
+GUIDE_PREFIX = "📌 Guía — "
+
 CAT_INFO = "╭・📌 INFORMACIÓN"
 CAT_COMMUNITY = "╭・💬 COMUNIDAD"
 CAT_GAMING = "╭・🎮 GAMING"
@@ -208,6 +215,103 @@ async def ensure_voice_channel(
             reason="Actualización del setup",
         )
     return channel
+
+
+
+async def ensure_guide(
+    channel: discord.TextChannel,
+    title: str,
+    description: str,
+    colour: discord.Colour = discord.Colour.blurple(),
+) -> discord.Message:
+    """Crea o actualiza una guía del bot sin duplicarla al repetir /setup."""
+    full_title = f"{GUIDE_PREFIX}{title}"
+    async for msg in channel.history(limit=60):
+        if msg.author == channel.guild.me and msg.embeds and msg.embeds[0].title == full_title:
+            embed = discord.Embed(title=full_title, description=description, colour=colour)
+            try:
+                await msg.edit(embed=embed)
+            except discord.Forbidden:
+                pass
+            return msg
+
+    embed = discord.Embed(title=full_title, description=description, colour=colour)
+    return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def find_bot_embed_message(
+    channel: discord.TextChannel,
+    title: str,
+    limit: int = 80,
+) -> Optional[discord.Message]:
+    async for msg in channel.history(limit=limit):
+        if msg.author == channel.guild.me and msg.embeds and msg.embeds[0].title == title:
+            return msg
+    return None
+
+
+async def ensure_reaction_role_panel(
+    channel: discord.TextChannel,
+    title: str,
+    description: str,
+    mapping: dict[str, str],
+) -> discord.Message:
+    """Crea/actualiza un panel de reaction roles y asegura todas las reacciones."""
+    message = await find_bot_embed_message(channel, title)
+    embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
+    embed.set_footer(text="Reaccioná para asignarte el rol • Quitá tu reacción para quitarlo")
+
+    if message is None:
+        message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        try:
+            await message.edit(embed=embed, view=None)
+        except discord.Forbidden:
+            pass
+
+    existing = {str(reaction.emoji) for reaction in message.reactions}
+    for emoji in mapping:
+        if emoji not in existing:
+            try:
+                await message.add_reaction(emoji)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+    return message
+
+
+async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
+    guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+    if guild is None:
+        return None, None, None
+
+    channel = guild.get_channel(payload.channel_id)
+    if not isinstance(channel, discord.TextChannel) or channel.name != CH_ROLES:
+        return guild, None, None
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return guild, None, None
+
+    if not message.embeds:
+        return guild, message, None
+
+    title = message.embeds[0].title
+    if title == ROLE_PANEL_COUNTRY_TITLE:
+        return guild, message, COUNTRY_REACTION_ROLES
+    if title == ROLE_PANEL_RANK_TITLE:
+        return guild, message, RANK_REACTION_ROLES
+    return guild, message, None
+
+
+async def reaction_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    member = guild.get_member(user_id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
 
 
 def staff_overwrites(
@@ -431,6 +535,163 @@ class SelfRolesView(discord.ui.View):
         super().__init__(timeout=None)
         self.add_item(CountrySelect())
         self.add_item(RankSelect())
+
+
+def get_member_valorant_rank(member: discord.Member) -> str:
+    """Devuelve el rango visual más alto que tenga el miembro."""
+    member_role_names = {role.name for role in member.roles}
+    for role_name in reversed(VALORANT_RANKS):
+        if role_name in member_role_names:
+            return role_name
+    return "⚫・Sin rango"
+
+
+def parse_party_footer(embed: discord.Embed):
+    footer = embed.footer.text or ""
+    match = re.search(r"party_owner:(\d+)\|max:(\d+)\|closed:(0|1)", footer)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), match.group(3) == "1"
+
+
+def parse_party_members(embed: discord.Embed) -> list[int]:
+    for field in embed.fields:
+        if field.name == "👥 Jugadores":
+            return [int(value) for value in re.findall(r"<@!?(\d+)>", field.value)]
+    return []
+
+
+def set_party_members(embed: discord.Embed, member_ids: list[int], max_players: int):
+    value = "\n".join(f"<@{member_id}>" for member_id in member_ids) or "—"
+    value += f"\n\n**{len(member_ids)}/{max_players}**"
+    for index, field in enumerate(embed.fields):
+        if field.name == "👥 Jugadores":
+            embed.set_field_at(index, name="👥 Jugadores", value=value, inline=False)
+            return
+
+
+def closed_party_view() -> discord.ui.View:
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Unirme", emoji="✅", style=discord.ButtonStyle.success, disabled=True))
+    view.add_item(discord.ui.Button(label="Salir", emoji="🚪", style=discord.ButtonStyle.secondary, disabled=True))
+    view.add_item(discord.ui.Button(label="Cerrar", emoji="🔒", style=discord.ButtonStyle.danger, disabled=True))
+    return view
+
+
+class PartyView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Unirme",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+        custom_id="streamer_server:party_join",
+    )
+    async def join_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return
+        if interaction.message is None or not interaction.message.embeds:
+            return await interaction.response.send_message(
+                "No pude leer esta búsqueda. Creá una nueva con `/party`.", ephemeral=True
+            )
+
+        embed = interaction.message.embeds[0].copy()
+        state = parse_party_footer(embed)
+        if state is None:
+            return await interaction.response.send_message(
+                "Esta búsqueda ya no es compatible. Creá una nueva con `/party`.", ephemeral=True
+            )
+
+        owner_id, max_players, closed = state
+        members = parse_party_members(embed)
+
+        if closed:
+            return await interaction.response.send_message("Esta búsqueda ya está cerrada.", ephemeral=True)
+        if interaction.user.id in members:
+            return await interaction.response.send_message("Ya estás dentro de este grupo.", ephemeral=True)
+        if len(members) >= max_players:
+            return await interaction.response.send_message("El grupo ya está completo.", ephemeral=True)
+
+        members.append(interaction.user.id)
+        set_party_members(embed, members, max_players)
+
+        if len(members) >= max_players:
+            embed.title = "✅ Grupo completo — Valorant"
+            embed.colour = discord.Colour.green()
+        else:
+            embed.title = "🔎 Buscando grupo — Valorant"
+            embed.colour = discord.Colour.blurple()
+
+        await interaction.response.edit_message(embed=embed, view=PartyView())
+
+    @discord.ui.button(
+        label="Salir",
+        emoji="🚪",
+        style=discord.ButtonStyle.secondary,
+        custom_id="streamer_server:party_leave",
+    )
+    async def leave_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return
+        if interaction.message is None or not interaction.message.embeds:
+            return await interaction.response.send_message(
+                "No pude leer esta búsqueda.", ephemeral=True
+            )
+
+        embed = interaction.message.embeds[0].copy()
+        state = parse_party_footer(embed)
+        if state is None:
+            return await interaction.response.send_message("Esta búsqueda ya no es compatible.", ephemeral=True)
+
+        owner_id, max_players, closed = state
+        members = parse_party_members(embed)
+
+        if closed:
+            return await interaction.response.send_message("Esta búsqueda ya está cerrada.", ephemeral=True)
+        if interaction.user.id == owner_id:
+            return await interaction.response.send_message(
+                "Sos quien creó el grupo. Si querés terminar la búsqueda, usá **Cerrar**.", ephemeral=True
+            )
+        if interaction.user.id not in members:
+            return await interaction.response.send_message("No estabas dentro de este grupo.", ephemeral=True)
+
+        members.remove(interaction.user.id)
+        set_party_members(embed, members, max_players)
+        embed.title = "🔎 Buscando grupo — Valorant"
+        embed.colour = discord.Colour.blurple()
+        await interaction.response.edit_message(embed=embed, view=PartyView())
+
+    @discord.ui.button(
+        label="Cerrar",
+        emoji="🔒",
+        style=discord.ButtonStyle.danger,
+        custom_id="streamer_server:party_close",
+    )
+    async def close_party(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return
+        if interaction.message is None or not interaction.message.embeds:
+            return await interaction.response.send_message("No pude leer esta búsqueda.", ephemeral=True)
+
+        embed = interaction.message.embeds[0].copy()
+        state = parse_party_footer(embed)
+        if state is None:
+            return await interaction.response.send_message("Esta búsqueda ya no es compatible.", ephemeral=True)
+
+        owner_id, max_players, closed = state
+        if closed:
+            return await interaction.response.send_message("Esta búsqueda ya está cerrada.", ephemeral=True)
+
+        if interaction.user.id != owner_id and not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "Solo quien creó la búsqueda o el staff puede cerrarla.", ephemeral=True
+            )
+
+        embed.title = "🔒 Búsqueda cerrada — Valorant"
+        embed.colour = discord.Colour.dark_grey()
+        embed.set_footer(text=f"party_owner:{owner_id}|max:{max_players}|closed:1")
+        await interaction.response.edit_message(embed=embed, view=closed_party_view())
 
 
 class TicketPanelView(discord.ui.View):
@@ -665,9 +926,9 @@ class SetupBot(commands.Bot):
         await start_health_server(self)
 
         self.add_view(VerifyView())
-        self.add_view(SelfRolesView())
         self.add_view(TicketPanelView())
         self.add_view(CloseTicketView())
+        self.add_view(PartyView())
 
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
@@ -682,6 +943,7 @@ intents.guilds = True
 intents.members = True
 intents.voice_states = True
 intents.messages = True
+intents.reactions = True
 intents.message_content = ENABLE_MESSAGE_LOGS
 
 bot = SetupBot(command_prefix="!", intents=intents)
@@ -694,6 +956,74 @@ async def on_ready():
         print(f"✅ Comandos sincronizados en el servidor {GUILD_ID}")
     else:
         print("ℹ️ Comandos globales sincronizados. Pueden tardar en aparecer.")
+
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
+        return
+
+    guild, message, mapping = await get_reaction_panel_mapping(payload)
+    if guild is None or message is None or mapping is None:
+        return
+
+    emoji = str(payload.emoji)
+    role_name = mapping.get(emoji)
+    if role_name is None:
+        return
+
+    member = await reaction_member(guild, payload.user_id)
+    if member is None or member.bot:
+        return
+
+    selected = find_role(guild, role_name)
+    if selected is None:
+        return
+
+    group_role_names = set(mapping.values())
+    old_roles = [role for role in member.roles if role.name in group_role_names and role != selected]
+
+    try:
+        if old_roles:
+            await member.remove_roles(*old_roles, reason="Cambio de reaction role visual")
+        if selected not in member.roles:
+            await member.add_roles(selected, reason="Reaction role visual")
+    except discord.Forbidden:
+        return
+
+    # Deja visualmente una sola reacción por grupo cuando el bot puede gestionarlas.
+    for reaction in message.reactions:
+        reaction_emoji = str(reaction.emoji)
+        if reaction_emoji in mapping and reaction_emoji != emoji:
+            try:
+                await reaction.remove(member)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
+        return
+
+    guild, _message, mapping = await get_reaction_panel_mapping(payload)
+    if guild is None or mapping is None:
+        return
+
+    role_name = mapping.get(str(payload.emoji))
+    if role_name is None:
+        return
+
+    member = await reaction_member(guild, payload.user_id)
+    role = find_role(guild, role_name)
+    if member is None or role is None or role not in member.roles:
+        return
+
+    try:
+        await member.remove_roles(role, reason="Reaction role retirada")
+    except discord.Forbidden:
+        pass
 
 
 @bot.tree.command(name="setup", description="Crea y configura la estructura completa del servidor.")
@@ -837,6 +1167,20 @@ async def setup_server(interaction: discord.Interaction):
             role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=True),
         }
 
+        roles_readonly = {
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            role_member: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=False,
+                add_reactions=True,
+                read_message_history=True,
+            ),
+            role_owner: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+            role_coowner: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+            role_admin: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+            role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+        }
+
         member_voice = {
             everyone: discord.PermissionOverwrite(view_channel=False, connect=False),
             role_member: discord.PermissionOverwrite(
@@ -868,7 +1212,7 @@ async def setup_server(interaction: discord.Interaction):
             verification_overwrites,
             "Verificate para desbloquear el resto del servidor.",
         )
-        await ensure_text_channel(
+        ch_rules = await ensure_text_channel(
             guild,
             cat_info,
             CH_RULES,
@@ -879,10 +1223,10 @@ async def setup_server(interaction: discord.Interaction):
             guild,
             cat_info,
             CH_ROLES,
-            member_readonly,
-            "Elegí tus roles visuales de país y rango de Valorant.",
+            roles_readonly,
+            "Reaccioná con una bandera y un rango para elegir tus roles visuales.",
         )
-        await ensure_text_channel(
+        ch_announcements = await ensure_text_channel(
             guild,
             cat_info,
             CH_ANNOUNCEMENTS,
@@ -897,7 +1241,7 @@ async def setup_server(interaction: discord.Interaction):
             embed_links=True,
             attach_files=True,
         )
-        await ensure_text_channel(
+        ch_streams = await ensure_text_channel(
             guild,
             cat_info,
             CH_STREAMS,
@@ -906,15 +1250,15 @@ async def setup_server(interaction: discord.Interaction):
         )
 
         # ── Comunidad ─────────────────────────────────────────────────────────
-        await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
-        await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
-        await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
+        ch_general = await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
+        ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
+        ch_memes = await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
         ch_commands = await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
 
         # ── Gaming ────────────────────────────────────────────────────────────
-        await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
-        await ensure_text_channel(guild, cat_gaming, CH_VALORANT, member_text, "Todo sobre Valorant.")
-        await ensure_text_channel(guild, cat_gaming, CH_LFG, member_text, "Buscá duo, team o gente para jugar.")
+        ch_gaming = await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
+        ch_valorant = await ensure_text_channel(guild, cat_gaming, CH_VALORANT, member_text, "Todo sobre Valorant.")
+        ch_lfg = await ensure_text_channel(guild, cat_gaming, CH_LFG, member_text, "Buscá duo, team o gente para jugar.")
 
         # ── Voz ───────────────────────────────────────────────────────────────
         await ensure_voice_channel(guild, cat_voice, VC_GENERAL, member_voice)
@@ -923,9 +1267,9 @@ async def setup_server(interaction: discord.Interaction):
         await ensure_voice_channel(guild, cat_voice, VC_CREATE, member_voice)
 
         # ── Staff ─────────────────────────────────────────────────────────────
-        await ensure_text_channel(guild, cat_staff, CH_STAFF, staff_ow, "Chat privado del staff.")
-        await ensure_text_channel(guild, cat_staff, CH_REPORTS, staff_ow, "Seguimiento interno de reportes.")
-        await ensure_text_channel(guild, cat_staff, CH_LOGS, staff_ow, "Logs y registros de moderación.")
+        ch_staff = await ensure_text_channel(guild, cat_staff, CH_STAFF, staff_ow, "Chat privado del staff.")
+        ch_reports = await ensure_text_channel(guild, cat_staff, CH_REPORTS, staff_ow, "Seguimiento interno de reportes.")
+        ch_logs = await ensure_text_channel(guild, cat_staff, CH_LOGS, staff_ow, "Logs y registros de moderación.")
 
         # ── Paneles automáticos ───────────────────────────────────────────────
         # Evita repetir paneles si /setup se ejecuta varias veces.
@@ -946,33 +1290,48 @@ async def setup_server(interaction: discord.Interaction):
             )
             await ch_verify.send(embed=embed, view=VerifyView())
 
-        # Migra el panel de roles desde #comandos a #roles si existe allí.
-        try:
-            async for msg in ch_commands.history(limit=50):
-                if msg.author == guild.me and msg.embeds and msg.embeds[0].title == "🌎 Roles de perfil":
-                    await msg.delete()
-        except discord.Forbidden:
-            pass
+        # Migra/limpia paneles viejos de roles con selectores.
+        for old_channel in (ch_commands, ch_roles):
+            try:
+                async for msg in old_channel.history(limit=80):
+                    if (
+                        msg.author == guild.me
+                        and msg.embeds
+                        and msg.embeds[0].title in {"🌎 Roles de perfil", "🎭 Elegí tus roles"}
+                    ):
+                        await msg.delete()
+            except discord.Forbidden:
+                pass
 
-        roles_already = False
-        async for msg in ch_roles.history(limit=30):
-            if msg.author == guild.me and msg.embeds and msg.embeds[0].title == "🎭 Elegí tus roles":
-                roles_already = True
-                break
+        country_lines = "\n".join(
+            f"{emoji}  **{role_name.split('・', 1)[1]}**"
+            for emoji, role_name in COUNTRY_REACTION_ROLES.items()
+        )
+        await ensure_reaction_role_panel(
+            ch_roles,
+            ROLE_PANEL_COUNTRY_TITLE,
+            (
+                "Reaccioná con la **bandera de tu país** y el bot te dará ese rol.\n"
+                "Si elegís otra bandera, reemplaza automáticamente la anterior.\n\n"
+                f"{country_lines}"
+            ),
+            COUNTRY_REACTION_ROLES,
+        )
 
-        if not roles_already:
-            embed = discord.Embed(
-                title="🎭 Elegí tus roles",
-                description=(
-                    "Personalizá tu perfil de la comunidad. Estos roles son **solo visuales** "
-                    "y no cambian tus permisos.\n\n"
-                    "🌎 **País:** elegí de dónde sos.\n"
-                    "🔫 **Valorant:** elegí tu rango actual.\n\n"
-                    "Podés cambiarlos cuando quieras."
-                ),
-                colour=discord.Colour.blurple(),
-            )
-            await ch_roles.send(embed=embed, view=SelfRolesView())
+        rank_lines = "\n".join(
+            f"{emoji}  **{role_name.split('・', 1)[1]}**"
+            for emoji, role_name in RANK_REACTION_ROLES.items()
+        )
+        await ensure_reaction_role_panel(
+            ch_roles,
+            ROLE_PANEL_RANK_TITLE,
+            (
+                "Reaccioná con tu **rango actual de Valorant**.\n"
+                "Solo podés tener un rango a la vez; si cambiás, el bot reemplaza el anterior.\n\n"
+                f"{rank_lines}"
+            ),
+            RANK_REACTION_ROLES,
+        )
 
         ticket_panel_already = False
         async for msg in ch_commands.history(limit=30):
@@ -991,10 +1350,89 @@ async def setup_server(interaction: discord.Interaction):
             )
             await ch_commands.send(embed=embed, view=TicketPanelView())
 
+        # ── Guías de uso por canal ─────────────────────────────────────────────
+        # Los paneles de verificación y roles ya cumplen la función de guía en esos canales.
+        await ensure_guide(
+            ch_rules,
+            "Reglas",
+            "Este canal es de **solo lectura**. Acá se publican las normas oficiales de la comunidad. "
+            "Leelas antes de participar y consultá al staff si alguna regla no queda clara.",
+        )
+        await ensure_guide(
+            ch_announcements,
+            "Anuncios",
+            "Acá se publican novedades importantes del servidor, eventos, cambios y avisos del staff. "
+            "Los miembros pueden leer, pero solo el staff publica.",
+        )
+        await ensure_guide(
+            ch_streams,
+            "Directos",
+            "Canal destinado a los avisos de stream y contenido de la streamer. "
+            "Más adelante puede conectarse con Twitch para publicar los directos automáticamente.",
+        )
+        await ensure_guide(
+            ch_general,
+            "General",
+            "Chat principal de la comunidad. Hablá, conocé gente y compartí con respeto. "
+            "Para buscar jugadores usá `🔎・busco-grupo` y para multimedia usá `📸・multimedia`.",
+        )
+        await ensure_guide(
+            ch_media,
+            "Multimedia",
+            "Compartí clips, capturas, fotos, fanarts y otro contenido multimedia. "
+            "Evitá contenido NSFW, spam o material que incumpla las reglas.",
+        )
+        await ensure_guide(
+            ch_memes,
+            "Memes",
+            "Canal para memes y humor de la comunidad. Mantené el contenido dentro de las reglas y sin ataques personales.",
+        )
+        await ensure_guide(
+            ch_commands,
+            "Comandos y soporte",
+            "Usá este canal para las utilidades del bot. Si necesitás hablar en privado con el staff, "
+            "usá el botón **Crear reporte** que aparece debajo.",
+        )
+        await ensure_guide(
+            ch_gaming,
+            "Gaming",
+            "Charlá sobre cualquier juego: Minecraft, cooperativos, shooters, juegos de historia y más. "
+            "Valorant tiene su canal propio para mantener todo ordenado.",
+        )
+        await ensure_guide(
+            ch_valorant,
+            "Valorant",
+            "Canal general de Valorant: rankeds, agentes, mapas, clips, estrategias y partidas. "
+            "Para armar grupo usá `🔎・busco-grupo`.",
+        )
+        await ensure_guide(
+            ch_lfg,
+            "Buscar grupo — Valorant",
+            "Usá **`/party`** acá para crear una búsqueda. Elegís modo, cuántas personas faltan y servidor.\n\n"
+            "El bot toma tu rango desde `🎭・roles` y publica una tarjeta con **Unirme**, **Salir** y **Cerrar**. "
+            "Cuando se completa el grupo, la tarjeta lo muestra automáticamente.",
+        )
+        await ensure_guide(
+            ch_staff,
+            "Staff",
+            "Chat interno del equipo de moderación. Usalo para coordinar decisiones, consultas y organización del servidor.",
+        )
+        await ensure_guide(
+            ch_reports,
+            "Reportes",
+            "Registro interno de tickets: el bot avisa acá cuando un miembro abre o cierra un reporte privado.",
+        )
+        await ensure_guide(
+            ch_logs,
+            "Logs",
+            "Registro automático del servidor: entradas, salidas, cambios de roles/apodos y cambios de canales/roles. "
+            "Los logs de contenido de mensajes son opcionales y están apagados por defecto.",
+        )
+
         await interaction.followup.send(
             "✅ **Setup completado.**\n"
             "Creé/actualicé roles, categorías, canales, permisos, verificación, "
-            "el canal de roles y el sistema privado de reportes.\n\n"
+            "reaction roles, guías por canal, el sistema privado de reportes y la búsqueda de grupo de Valorant.\n\n"
             "No borré ningún canal ni rol que ya existiera.",
             ephemeral=True,
         )
@@ -1013,6 +1451,81 @@ async def setup_server(interaction: discord.Interaction):
         )
         raise
 
+
+
+@bot.tree.command(name="party", description="Buscá gente para jugar Valorant.")
+@app_commands.guild_only()
+@app_commands.describe(
+    modo="Qué modo van a jugar",
+    cupos="Cuántas personas te faltan (1 a 4)",
+    servidor="Servidor o región, por ejemplo Santiago, São Paulo o Miami",
+)
+@app_commands.choices(
+    modo=[
+        app_commands.Choice(name="Competitivo", value="Competitivo"),
+        app_commands.Choice(name="Swiftplay", value="Swiftplay"),
+        app_commands.Choice(name="No competitivo", value="No competitivo"),
+        app_commands.Choice(name="Premier", value="Premier"),
+        app_commands.Choice(name="Deathmatch / TDM", value="Deathmatch / TDM"),
+        app_commands.Choice(name="Otro", value="Otro"),
+    ]
+)
+async def party_command(
+    interaction: discord.Interaction,
+    modo: app_commands.Choice[str],
+    cupos: app_commands.Range[int, 1, 4] = 4,
+    servidor: Optional[str] = None,
+):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        return
+
+    lfg_channel = find_text(interaction.guild, CH_LFG)
+    if lfg_channel is None:
+        return await interaction.response.send_message(
+            "No encuentro el canal de búsqueda de grupo. Un administrador debe ejecutar `/setup`.",
+            ephemeral=True,
+        )
+
+    if interaction.channel_id != lfg_channel.id:
+        return await interaction.response.send_message(
+            f"Usá `/party` dentro de {lfg_channel.mention} para no llenar otros canales.",
+            ephemeral=True,
+        )
+
+    member_role = find_role(interaction.guild, ROLE_MEMBER)
+    if member_role is not None and member_role not in interaction.user.roles and not is_staff(interaction.user):
+        return await interaction.response.send_message(
+            "Primero tenés que verificarte.", ephemeral=True
+        )
+
+    max_players = 1 + int(cupos)
+    rank = get_member_valorant_rank(interaction.user)
+    server_text = safe_text(servidor.strip(), 80) if servidor and servidor.strip() else "No especificado"
+
+    embed = discord.Embed(
+        title="🔎 Buscando grupo — Valorant",
+        description=(
+            f"**{interaction.user.display_name}** está buscando gente para jugar.\\n"
+            "Tocá **Unirme** para sumarte."
+        ),
+        colour=discord.Colour.blurple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="🎯 Modo", value=modo.value, inline=True)
+    embed.add_field(name="🏅 Rango", value=rank, inline=True)
+    embed.add_field(name="🌐 Servidor", value=server_text, inline=True)
+    embed.add_field(
+        name="👥 Jugadores",
+        value=f"{interaction.user.mention}\\n\\n**1/{max_players}**",
+        inline=False,
+    )
+    embed.set_footer(text=f"party_owner:{interaction.user.id}|max:{max_players}|closed:0")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=PartyView(),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGS AUTOMÁTICOS
