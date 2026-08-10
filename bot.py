@@ -61,7 +61,21 @@ VALORANT_RANKS = [
 ]
 
 COUNTRY_REACTION_ROLES = {name.split("・", 1)[0]: name for name in COUNTRIES}
-RANK_REACTION_ROLES = {name.split("・", 1)[0]: name for name in VALORANT_RANKS}
+
+# El bot busca estos emojis personalizados por NOMBRE dentro del servidor.
+# Si alguno no existe, usa temporalmente el emoji normal del rol como fallback.
+VALORANT_CUSTOM_EMOJIS = {
+    "⚫・Sin rango": None,
+    "⬛・Hierro": "valoranthierro",
+    "🟫・Bronce": "valorantbronce",
+    "⬜・Plata": "valorantplata",
+    "🟨・Oro": "valorantoro",
+    "🟩・Platino": "valorantplatino",
+    "💎・Diamante": "valorantdiamante",
+    "🟪・Ascendente": "valorantascendente",
+    "🟥・Inmortal": "valorantimmortal",
+    "🌟・Radiante": "valorantradiante",
+}
 
 ROLE_PANEL_COUNTRY_TITLE = "🌎 Elegí tu país"
 ROLE_PANEL_RANK_TITLE = "🔫 Elegí tu rango de Valorant"
@@ -120,6 +134,25 @@ def find_voice(guild: discord.Guild, name: str) -> Optional[discord.VoiceChannel
     return discord.utils.get(guild.voice_channels, name=name)
 
 
+def build_rank_reaction_roles(guild: discord.Guild) -> dict[str, str]:
+    """Devuelve emoji -> rol usando los emojis personalizados del servidor por nombre."""
+    mapping: dict[str, str] = {}
+
+    for role_name in VALORANT_RANKS:
+        emoji_name = VALORANT_CUSTOM_EMOJIS.get(role_name)
+
+        if emoji_name:
+            custom_emoji = discord.utils.get(guild.emojis, name=emoji_name)
+            if custom_emoji is not None:
+                mapping[str(custom_emoji)] = role_name
+                continue
+
+        # Fallback si el emoji personalizado todavía no fue subido.
+        mapping[role_name.split("・", 1)[0]] = role_name
+
+    return mapping
+
+
 async def ensure_role(
     guild: discord.Guild,
     name: str,
@@ -138,6 +171,12 @@ async def ensure_role(
             reason="Setup automático del servidor",
         )
     else:
+        # Discord no permite que un bot edite roles que estén por encima de su rol.
+        # Los respetamos en vez de hacer fallar todo /setup.
+        bot_member = guild.me
+        if bot_member is not None and role >= bot_member.top_role:
+            return role
+
         await role.edit(
             permissions=permissions,
             colour=discord.Colour(colour),
@@ -269,12 +308,28 @@ async def ensure_reaction_role_panel(
         except discord.Forbidden:
             pass
 
+    # Sincroniza las reacciones del panel:
+    # quita las que ya no están configuradas y agrega las nuevas.
+    wanted = set(mapping.keys())
+
+    for reaction in list(message.reactions):
+        if str(reaction.emoji) not in wanted:
+            try:
+                await message.clear_reaction(reaction.emoji)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
     existing = {str(reaction.emoji) for reaction in message.reactions}
     for emoji in mapping:
         if emoji not in existing:
             try:
-                await message.add_reaction(emoji)
-            except (discord.Forbidden, discord.HTTPException):
+                reaction_emoji = (
+                    discord.PartialEmoji.from_str(emoji)
+                    if emoji.startswith("<")
+                    else emoji
+                )
+                await message.add_reaction(reaction_emoji)
+            except (discord.Forbidden, discord.HTTPException, ValueError):
                 pass
     return message
 
@@ -300,7 +355,7 @@ async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
     if title == ROLE_PANEL_COUNTRY_TITLE:
         return guild, message, COUNTRY_REACTION_ROLES
     if title == ROLE_PANEL_RANK_TITLE:
-        return guild, message, RANK_REACTION_ROLES
+        return guild, message, build_rank_reaction_roles(guild)
     return guild, message, None
 
 
@@ -1318,9 +1373,10 @@ async def setup_server(interaction: discord.Interaction):
             COUNTRY_REACTION_ROLES,
         )
 
+        rank_reaction_roles = build_rank_reaction_roles(guild)
         rank_lines = "\n".join(
             f"{emoji}  **{role_name.split('・', 1)[1]}**"
-            for emoji, role_name in RANK_REACTION_ROLES.items()
+            for emoji, role_name in rank_reaction_roles.items()
         )
         await ensure_reaction_role_panel(
             ch_roles,
@@ -1330,7 +1386,7 @@ async def setup_server(interaction: discord.Interaction):
                 "Solo podés tener un rango a la vez; si cambiás, el bot reemplaza el anterior.\n\n"
                 f"{rank_lines}"
             ),
-            RANK_REACTION_ROLES,
+            rank_reaction_roles,
         )
 
         ticket_panel_already = False

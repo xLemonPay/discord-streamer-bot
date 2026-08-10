@@ -1,21 +1,37 @@
-# Discord Streamer Bot v4
+# Discord Streamer Bot v5
 
-## Cambios principales
+## Emojis personalizados de Valorant
 
-- `🎭・roles` ahora usa **reaction roles**.
-- País: reaccionás con la bandera.
-- Valorant: reaccionás con el emoji del rango.
-- Solo se mantiene un país y un rango por usuario.
-- Al quitar la reacción, se quita el rol.
-- `/setup` elimina el panel viejo con menús desplegables y crea los nuevos paneles.
-- Se agregan guías automáticas en los canales de texto para explicar qué se hace en cada uno.
-- Se conserva `/party` en `🔎・busco-grupo`.
-- Se conservan tickets, logs, verificación y salas temporales.
+El bot busca automáticamente estos nombres dentro del servidor:
 
-## Después del deploy
+- `valoranthierro`
+- `valorantbronce`
+- `valorantplata`
+- `valorantoro`
+- `valorantplatino`
+- `valorantdiamante`
+- `valorantascendente`
+- `valorantimmortal`
+- `valorantradiante`
 
-Cuando Northflank vuelva a mostrar `Running`, ejecutá:
+`Sin rango` usa ⚫.
 
-`/setup`
+No hace falta copiar IDs de emojis.
 
-una sola vez para migrar los paneles y crear/actualizar las guías.
+## Actualizar el panel
+
+1. Subí/reemplazá `bot.py` en GitHub.
+2. Esperá que Northflank vuelva a `Running`.
+3. Ejecutá `/setup`.
+4. El bot:
+   - busca los emojis por nombre;
+   - elimina las reacciones viejas del panel de Valorant;
+   - coloca las nuevas;
+   - actualiza el texto del embed.
+
+Si falta un emoji personalizado, usa temporalmente el emoji de color correspondiente.
+
+## Jerarquía
+
+`/setup` ahora respeta roles que estén por encima del rol del bot y no intenta editarlos,
+evitando que toda la configuración falle por el rol Owner.
