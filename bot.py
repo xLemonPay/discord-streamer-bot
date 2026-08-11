@@ -151,7 +151,39 @@ async def ensure_twitch_roles(guild: discord.Guild) -> tuple[discord.Role, disco
     no_perms = discord.Permissions.none()
     live_role = await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
     notify_role = await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
+    await ensure_streamer_role_order(guild)
     return live_role, notify_role
+
+
+async def ensure_streamer_role_order(guild: discord.Guild) -> None:
+    """
+    Coloca EN DIRECTO y Streamer como los dos roles más altos que el bot puede
+    administrar. Owner puede permanecer por encima del bot; para que no tape
+    visualmente a la streamer debe estar sin hoist y sin color, configurado
+    manualmente porque un bot no puede editar un rol que esté por encima suyo.
+    """
+    me = guild.me
+    live_role = find_role(guild, ROLE_LIVE)
+    streamer_role = find_role(guild, ROLE_STREAMER)
+    if me is None or live_role is None or streamer_role is None:
+        return
+
+    try:
+        if live_role < me.top_role:
+            target = max(1, me.top_role.position - 1)
+            if live_role.position != target:
+                await live_role.edit(position=target, reason="Jerarquía visual de Twitch")
+
+        # Releer posiciones después de mover EN DIRECTO.
+        live_role = find_role(guild, ROLE_LIVE)
+        streamer_role = find_role(guild, ROLE_STREAMER)
+        if live_role is not None and streamer_role is not None and streamer_role < me.top_role:
+            target = max(1, live_role.position - 1)
+            if streamer_role.position != target:
+                await streamer_role.edit(position=target, reason="Jerarquía visual de la streamer")
+    except (discord.Forbidden, discord.HTTPException):
+        # No hacemos fallar Twitch si Discord no permite reordenar un rol.
+        pass
 
 
 async def ensure_twitch_notify_panel(guild: discord.Guild) -> Optional[discord.Message]:
@@ -200,6 +232,68 @@ def twitch_live_channel_overwrites(guild: discord.Guild) -> dict:
         if role is not None:
             ow[role] = normal
     return ow
+
+
+def twitch_live_voice_overwrites(guild: discord.Guild) -> dict:
+    everyone = guild.default_role
+    member = find_role(guild, ROLE_MEMBER)
+    streamer = find_role(guild, ROLE_STREAMER)
+    owner = find_role(guild, ROLE_OWNER)
+    coowner = find_role(guild, ROLE_COOWNER)
+    admin = find_role(guild, ROLE_ADMIN)
+    mod = find_role(guild, ROLE_MOD)
+
+    ow = {
+        everyone: discord.PermissionOverwrite(view_channel=False, connect=False),
+    }
+
+    if member is not None:
+        ow[member] = discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True, stream=True,
+            use_voice_activation=True,
+        )
+
+    # La streamer tiene controles de moderación dentro de la voz del directo.
+    if streamer is not None:
+        ow[streamer] = discord.PermissionOverwrite(
+            view_channel=True, connect=True, speak=True, stream=True,
+            use_voice_activation=True, priority_speaker=True,
+            mute_members=True, deafen_members=True, move_members=True,
+        )
+
+    staff_voice = discord.PermissionOverwrite(
+        view_channel=True, connect=True, speak=True, stream=True,
+        use_voice_activation=True, mute_members=True, deafen_members=True,
+        move_members=True,
+    )
+    for role in (owner, coowner, admin, mod):
+        if role is not None:
+            ow[role] = staff_voice
+    return ow
+
+
+async def ensure_live_voice_channel(guild: discord.Guild) -> discord.VoiceChannel:
+    channel = find_voice(guild, VC_LIVE)
+    category = find_category(guild, CAT_VOICE)
+    if category is None:
+        raise RuntimeError("No encuentro la categoría de VOZ")
+
+    overwrites = twitch_live_voice_overwrites(guild)
+    if channel is None:
+        channel = await guild.create_voice_channel(
+            VC_LIVE,
+            category=category,
+            overwrites=overwrites,
+            user_limit=0,
+            reason="La streamer empezó directo en Twitch",
+        )
+    elif channel.category_id != category.id:
+        await channel.edit(
+            category=category,
+            overwrites=overwrites,
+            reason="Sincronización de la voz del directo",
+        )
+    return channel
 
 
 async def ensure_live_channel(guild: discord.Guild, stream: dict) -> discord.TextChannel:
@@ -435,6 +529,13 @@ async def delete_live_channel_later(guild_id: int) -> None:
                 await channel.delete(reason="El directo de Twitch terminó")
             except discord.Forbidden:
                 pass
+
+        voice_channel = find_voice(guild, VC_LIVE)
+        if voice_channel is not None:
+            try:
+                await voice_channel.delete(reason="El directo de Twitch terminó")
+            except discord.Forbidden:
+                pass
     finally:
         _twitch_delete_task = None
 
@@ -455,6 +556,7 @@ async def handle_twitch_online(guild: discord.Guild, stream: dict) -> None:
         await ensure_twitch_notify_panel(guild)
 
     live_channel = await ensure_live_channel(guild, stream)
+    live_voice = await ensure_live_voice_channel(guild)
     await add_live_role_to_streamer(guild)
 
     if first_sync:
@@ -480,6 +582,12 @@ async def handle_twitch_online(guild: discord.Guild, stream: dict) -> None:
                 view=twitch_link_view(),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
+            await live_channel.send(
+                "🔊 **Canal de voz del directo:** " + live_voice.mention + "\n"
+                "⚠️ Al entrar, tu voz puede escucharse en Twitch. Entrá con respeto: "
+                "sin gritos, insultos, spam ni contenido inapropiado. La streamer y el staff pueden moderar la sala.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
         except discord.Forbidden:
             pass
 
@@ -497,8 +605,9 @@ async def handle_twitch_offline(guild: discord.Guild) -> None:
         await bot.change_presence(status=discord.Status.online, activity=None)
 
     live_channel = find_text(guild, CH_LIVE)
-    if live_channel is not None and (_twitch_delete_task is None or _twitch_delete_task.done()):
-        if was_live:
+    live_voice = find_voice(guild, VC_LIVE)
+    if (live_channel is not None or live_voice is not None) and (_twitch_delete_task is None or _twitch_delete_task.done()):
+        if was_live and live_channel is not None:
             minutes = max(0, TWITCH_OFFLINE_DELETE_DELAY // 60)
             text = "🌙 **El directo terminó.** Gracias por acompañar 💜"
             if TWITCH_OFFLINE_DELETE_DELAY:
@@ -556,6 +665,19 @@ ROLE_VIP = "⭐・VIP"
 ROLE_LIVE = "🔴・EN DIRECTO"
 ROLE_LIVE_NOTIFY = "🔔・Avisos de directo"
 
+# Roles visuales de edad. No guardan la edad exacta, solo un rango general.
+AGE_ROLES = [
+    "🧒・Menor de 18",
+    "🎂・18-25",
+    "🧑・26+",
+]
+
+AGE_REACTION_ROLES = {
+    "🧒": "🧒・Menor de 18",
+    "🎂": "🎂・18-25",
+    "🧑": "🧑・26+",
+}
+
 COUNTRIES = [
     "🇵🇾・Paraguay",
     "🇦🇷・Argentina",
@@ -603,6 +725,7 @@ VALORANT_CUSTOM_EMOJIS = {
 }
 
 ROLE_PANEL_COUNTRY_TITLE = "🌎 Elegí tu país"
+ROLE_PANEL_AGE_TITLE = "🎂 Elegí tu rango de edad"
 ROLE_PANEL_RANK_TITLE = "🔫 Elegí tu rango de Valorant"
 ROLE_PANEL_NOTIFY_TITLE = "🔔 Avisos de directo"
 STREAM_NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY}
@@ -636,6 +759,7 @@ VC_GENERAL = "🔊・General"
 VC_GAMING = "🎮・Gaming"
 VC_VALORANT = "🔫・Valorant"
 VC_CREATE = "➕・Crear sala"
+VC_LIVE = "🔴・EN DIRECTO | RESPETO"
 TEMP_VC_PREFIX = "🎮・Sala de "
 
 CH_STAFF = "💬・staff"
@@ -883,6 +1007,8 @@ async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
     title = message.embeds[0].title
     if title == ROLE_PANEL_COUNTRY_TITLE:
         return guild, message, COUNTRY_REACTION_ROLES
+    if title == ROLE_PANEL_AGE_TITLE:
+        return guild, message, AGE_REACTION_ROLES
     if title == ROLE_PANEL_RANK_TITLE:
         return guild, message, build_rank_reaction_roles(guild)
     if title == ROLE_PANEL_NOTIFY_TITLE:
@@ -1707,6 +1833,9 @@ async def setup_server(interaction: discord.Interaction):
         await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
 
         # Roles visuales: 0 permisos.
+        for name in AGE_ROLES:
+            await ensure_role(guild, name, no_perms, 0x99AAB5, False)
+
         for name in COUNTRIES:
             await ensure_role(guild, name, no_perms, 0x99AAB5, False)
 
@@ -1837,7 +1966,7 @@ async def setup_server(interaction: discord.Interaction):
             cat_info,
             CH_ROLES,
             roles_readonly,
-            "Reaccioná con una bandera y un rango para elegir tus roles visuales.",
+            "Reaccioná para elegir país, rango de edad y rango de Valorant.",
         )
         ch_announcements = await ensure_text_channel(
             guild,
@@ -1963,6 +2092,21 @@ async def setup_server(interaction: discord.Interaction):
                 f"{country_lines}"
             ),
             COUNTRY_REACTION_ROLES,
+        )
+
+        age_lines = "\n".join(
+            f"{emoji}  **{role_name.split('・', 1)[1]}**"
+            for emoji, role_name in AGE_REACTION_ROLES.items()
+        )
+        await ensure_reaction_role_panel(
+            ch_roles,
+            ROLE_PANEL_AGE_TITLE,
+            (
+                "Reaccioná con tu **rango de edad**. No hace falta publicar tu edad exacta.\n"
+                "Solo podés tener un rango de edad a la vez; si cambiás, el bot reemplaza el anterior.\n\n"
+                f"{age_lines}"
+            ),
+            AGE_REACTION_ROLES,
         )
 
         rank_reaction_roles = build_rank_reaction_roles(guild)
@@ -2243,7 +2387,7 @@ async def update_channels_command(interaction: discord.Interaction):
     await set_progress(interaction, "🔄 **Canales:** actualizando INFORMACIÓN...")
     await ensure_text_channel(guild, cat_info, CH_VERIFY, verification_overwrites, "Verificate para desbloquear el resto del servidor.")
     await ensure_text_channel(guild, cat_info, CH_RULES, public_readonly, "Reglas y convivencia de la comunidad.")
-    await ensure_text_channel(guild, cat_info, CH_ROLES, roles_readonly, "Reaccioná con una bandera y un rango para elegir tus roles visuales.")
+    await ensure_text_channel(guild, cat_info, CH_ROLES, roles_readonly, "Reaccioná para elegir país, rango de edad y rango de Valorant.")
     await ensure_text_channel(guild, cat_info, CH_ANNOUNCEMENTS, public_readonly, "Anuncios oficiales del servidor.")
 
     stream_ow = dict(public_readonly)
@@ -2338,9 +2482,13 @@ async def update_roles_command(interaction: discord.Interaction):
 
     await ensure_twitch_roles(guild)
 
+    no_perms = discord.Permissions.none()
+    for role_name in AGE_ROLES:
+        await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
+
     # Verifica qué roles puede administrar antes de tocar los paneles.
     blocked_roles = []
-    for role_name in list(COUNTRIES) + list(VALORANT_RANKS) + [ROLE_LIVE, ROLE_LIVE_NOTIFY]:
+    for role_name in list(COUNTRIES) + list(AGE_ROLES) + list(VALORANT_RANKS) + [ROLE_LIVE, ROLE_LIVE_NOTIFY]:
         role = find_role(guild, role_name)
         if role is not None and role >= bot_member.top_role:
             blocked_roles.append(role.name)
@@ -2369,7 +2517,7 @@ async def update_roles_command(interaction: discord.Interaction):
                 pass
             continue
 
-        if title in {ROLE_PANEL_COUNTRY_TITLE, ROLE_PANEL_RANK_TITLE, ROLE_PANEL_NOTIFY_TITLE}:
+        if title in {ROLE_PANEL_COUNTRY_TITLE, ROLE_PANEL_AGE_TITLE, ROLE_PANEL_RANK_TITLE, ROLE_PANEL_NOTIFY_TITLE}:
             if title in current_seen:
                 try:
                     await msg.delete()
@@ -2392,6 +2540,22 @@ async def update_roles_command(interaction: discord.Interaction):
             "Solo podés tener **un país** a la vez. Si reaccionás a otro, el bot reemplaza el anterior."
         ),
         COUNTRY_REACTION_ROLES,
+    )
+
+    await set_progress(interaction, "🔄 **Roles:** actualizando rangos de edad...")
+    age_lines = "\n".join(
+        role_panel_line(guild, emoji, role_name)
+        for emoji, role_name in AGE_REACTION_ROLES.items()
+    )
+    await ensure_reaction_role_panel(
+        ch_roles,
+        ROLE_PANEL_AGE_TITLE,
+        (
+            "↳ **Seleccioná tu rango de edad.** No hace falta decir tu edad exacta.\n\n"
+            f"{age_lines}\n\n"
+            "Solo podés tener **un rango de edad** a la vez. Si reaccionás a otro, el bot reemplaza el anterior."
+        ),
+        AGE_REACTION_ROLES,
     )
 
     await set_progress(interaction, "🔄 **Roles:** buscando iconos personalizados de Valorant...")
@@ -2432,6 +2596,7 @@ async def update_roles_command(interaction: discord.Interaction):
             interaction,
             "✅ **Panel de roles actualizado.**\n"
             "🇵🇾 Países sincronizados.\n"
+            "🎂 Rangos de edad sincronizados.\n"
             "🎖️ Rangos de Valorant sincronizados con los emojis personalizados.\n"
             "🔔 Avisos de directo listos.",
         )
@@ -2595,6 +2760,7 @@ async def update_twitch_command(interaction: discord.Interaction):
             "✅ **Twitch funcionando.**\n"
             f"🔴 `@{TWITCH_CHANNEL}` está EN DIRECTO ahora.\n"
             f"✅ `{CH_LIVE}` sincronizado.\n"
+            f"✅ `{VC_LIVE}` creado/sincronizado.\n"
             f"✅ `{ROLE_LIVE}` asignado a la streamer.\n"
             f"✅ El bot revisará Twitch cada {TWITCH_POLL_SECONDS} segundos."
         )
@@ -2606,6 +2772,7 @@ async def update_twitch_command(interaction: discord.Interaction):
             f"⚫ `@{TWITCH_CHANNEL}` está offline ahora.\n"
             f"✅ `{ROLE_LIVE}` se asignará automáticamente al prender.\n"
             f"✅ `{CH_LIVE}` aparecerá automáticamente al prender.\n"
+            f"✅ `{VC_LIVE}` aparecerá automáticamente al prender.\n"
             f"✅ El bot revisará Twitch cada {TWITCH_POLL_SECONDS} segundos."
         )
 
@@ -2631,6 +2798,7 @@ async def twitch_status_command(interaction: discord.Interaction):
         return await set_progress(interaction, f"❌ Error consultando Twitch: `{type(exc).__name__}: {str(exc)[:500]}`")
 
     live_channel = find_text(interaction.guild, CH_LIVE)
+    live_voice = find_voice(interaction.guild, VC_LIVE)
     live_role = find_role(interaction.guild, ROLE_LIVE)
     streamer_members = twitch_streamer_members(interaction.guild)
     role_active = bool(live_role and any(live_role in member.roles for member in streamer_members))
@@ -2639,7 +2807,8 @@ async def twitch_status_command(interaction: discord.Interaction):
         "✅ **Integración de Twitch conectada**",
         f"Canal: `@{TWITCH_CHANNEL}`",
         f"Estado Twitch: {'🔴 EN DIRECTO' if stream else '⚫ Offline'}",
-        f"Canal temporal: {'✅ existe' if live_channel else '— no existe'}",
+        f"Canal de texto temporal: {'✅ existe' if live_channel else '— no existe'}",
+        f"Canal de voz temporal: {'✅ existe' if live_voice else '— no existe'}",
         f"Rol EN DIRECTO: {'✅ activo' if role_active else '— inactivo'}",
         f"Modo de prueba: {'🧪 ACTIVO' if _twitch_test_mode else '— inactivo'}",
         f"Chequeo: cada {TWITCH_POLL_SECONDS}s",
@@ -2698,6 +2867,7 @@ async def twitch_simulate_command(interaction: discord.Interaction):
         await set_progress(interaction, "🧪 **Twitch prueba:** creando el canal temporal...")
         stream = twitch_test_stream()
         live_channel = await ensure_live_channel(guild, stream)
+        live_voice = await ensure_live_voice_channel(guild)
 
         assigned = await add_live_role_to_streamer(guild)
 
@@ -2720,7 +2890,11 @@ async def twitch_simulate_command(interaction: discord.Interaction):
             )
 
         await live_channel.send(
-            content="🧪 **Canal temporal creado en modo de prueba.**",
+            content=(
+                "🧪 **Canal temporal creado en modo de prueba.**\n"
+                f"🔊 Voz de prueba: {live_voice.mention}\n"
+                "⚠️ Al entrar a la voz, asumí que tu audio podría salir en el directo: respeto ante todo."
+            ),
             embed=twitch_test_embed(stream),
             view=twitch_link_view(),
             allowed_mentions=discord.AllowedMentions.none(),
@@ -2736,6 +2910,7 @@ async def twitch_simulate_command(interaction: discord.Interaction):
             interaction,
             "✅ **Simulación de Twitch activa.**\n"
             f"✅ `{CH_LIVE}` creado/sincronizado.\n"
+            f"✅ `{VC_LIVE}` creado/sincronizado.\n"
             f"{streamer_note}\n"
             f"✅ Se publicó un aviso de prueba en `{CH_STREAMS}` sin mencionar a nadie.\n"
             "✅ El estado del bot muestra Streaming [PRUEBA].\n\n"
@@ -2786,6 +2961,16 @@ async def twitch_end_test_command(interaction: discord.Interaction):
                 f"❌ No pude borrar `{CH_LIVE}`. Revisá el permiso Gestionar canales."
             )
 
+    live_voice = find_voice(guild, VC_LIVE)
+    if live_voice is not None:
+        try:
+            await live_voice.delete(reason="Fin de la simulación de Twitch")
+        except discord.Forbidden:
+            return await set_progress(
+                interaction,
+                f"❌ No pude borrar `{VC_LIVE}`. Revisá el permiso Gestionar canales."
+            )
+
     await bot.change_presence(status=discord.Status.online, activity=None)
 
     result = await sync_real_twitch_after_test(guild)
@@ -2793,7 +2978,8 @@ async def twitch_end_test_command(interaction: discord.Interaction):
         interaction,
         "✅ **Simulación terminada.**\n"
         f"✅ `{ROLE_LIVE}` de prueba retirado.\n"
-        f"✅ Canal temporal de prueba eliminado.\n"
+        f"✅ Canal de texto temporal de prueba eliminado.\n"
+        f"✅ Canal de voz temporal de prueba eliminado.\n"
         f"🔄 Estado real: {result}"
     )
 

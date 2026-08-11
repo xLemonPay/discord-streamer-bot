@@ -249,35 +249,7 @@ Muestra:
 - online/offline;
 - existencia del canal temporal;
 - estado del rol EN DIRECTO;
-- modo de prueba;
 - frecuencia de consulta.
-
-### Pruebas sin prender Twitch
-
-```text
-/twitch-preview
-```
-
-Muestra una **vista previa privada** del anuncio. No crea canales, no asigna roles y no menciona a nadie.
-
-```text
-/twitch-simular
-```
-
-Simula el flujo completo:
-
-- crea `🔴・stream-en-vivo`;
-- asigna `🔴・EN DIRECTO` a quien tenga `🎥・Streamer`;
-- publica un aviso marcado como **SIMULACIÓN** en `🎥・directos`;
-- no menciona `🔔・Avisos de directo` durante la prueba;
-- cambia la presencia del bot a Streaming `[PRUEBA]`;
-- pausa temporalmente el watcher real para que no desarme la simulación.
-
-```text
-/twitch-fin-prueba
-```
-
-Termina la simulación, quita `🔴・EN DIRECTO`, elimina el canal temporal y vuelve a consultar Twitch real para restaurar inmediatamente el estado correcto.
 
 ---
 
@@ -325,18 +297,6 @@ Configura y prueba Twitch.
 
 Comprueba el estado actual de Twitch.
 
-### `/twitch-preview`
-
-Vista previa privada del anuncio de Twitch.
-
-### `/twitch-simular`
-
-Simula un directo completo sin prender Twitch.
-
-### `/twitch-fin-prueba`
-
-Finaliza la simulación y restaura Twitch real.
-
 ### `/party`
 
 Comando de usuario para buscar grupo de Valorant.
@@ -359,7 +319,7 @@ Comando de usuario para buscar grupo de Valorant.
 │・📸・multimedia
 │・😂・memes
 │・🤖・comandos
-╰・🔴・stream-en-vivo      ← solo existe durante stream o simulación
+╰・🔴・stream-en-vivo      ← solo existe durante stream
 
 ╭・🎮 GAMING
 │・🎮・gaming
@@ -398,7 +358,7 @@ Comando de usuario para buscar grupo de Valorant.
 - `🎥・Streamer`
 - `💜・Subscriber`
 - `⭐・VIP`
-- `🔴・EN DIRECTO` — temporal mientras Twitch está live o durante una simulación.
+- `🔴・EN DIRECTO` — temporal mientras Twitch está live.
 - `🔔・Avisos de directo` — optativo para recibir menciones.
 
 Países y rangos de Valorant son visuales y no tienen permisos administrativos.
@@ -483,8 +443,6 @@ README.md            Manual completo
 - guías → `/actualizar-guias`
 - tickets → `/actualizar-tickets`
 - Twitch → `/actualizar-twitch`
-- vista previa Twitch → `/twitch-preview`
-- simulación Twitch → `/twitch-simular` y luego `/twitch-fin-prueba`
 - instalación completa → `/setup`
 
 ---
@@ -496,3 +454,51 @@ README.md            Manual completo
 - `.env` debe permanecer fuera del repositorio;
 - el bot no registra contenido de mensajes salvo que se habilite expresamente;
 - los IDs de emojis de Valorant no necesitan guardarse porque se resuelven por nombre.
+
+
+## 🧪 Pruebas de Twitch sin prender stream
+
+- `/twitch-preview`: muestra una vista previa privada. No crea canales, no da roles y no menciona a nadie.
+- `/twitch-simular`: simula el flujo completo: crea `🔴・stream-en-vivo`, asigna `🔴・EN DIRECTO`, publica un aviso marcado como prueba en `🎥・directos` sin mencionar a nadie y pone al bot en Streaming [PRUEBA].
+- `/twitch-fin-prueba`: termina la simulación, quita el rol, elimina el canal temporal y vuelve a consultar Twitch real para restaurar el estado correcto.
+
+Mientras `/twitch-simular` está activo, el watcher real de Twitch queda pausado para que no desarme la prueba.
+
+
+## 🎂 Roles de edad
+
+En `🎭・roles` hay un panel adicional, exclusivo por reacción:
+
+- `🧒・Menor de 18`
+- `🎂・18-25`
+- `🧑・26+`
+
+Solo se conserva un rango a la vez y no se solicita la edad exacta. Son roles visuales, sin permisos.
+
+## 🔊 Voz automática durante el stream
+
+Cuando Twitch detecta el directo, además del canal de texto `🔴・stream-en-vivo`, el bot crea `🔴・EN DIRECTO | RESPETO` dentro de VOZ. Los miembros verificados pueden entrar y hablar; la streamer y el staff pueden moderar la sala. El canal de texto avisa que la voz de quienes entren puede escucharse en Twitch. Al terminar el directo, el canal de voz se elimina junto con el canal de texto después del retraso configurado.
+
+`/twitch-simular` también crea este canal de voz y `/twitch-fin-prueba` lo elimina.
+
+## 👑 Jerarquía visual recomendada
+
+De arriba hacia abajo:
+
+```text
+👑・Owner                 (sin color y sin mostrar por separado)
+Server Setup              (bot)
+🔴・EN DIRECTO            (rojo, mostrar por separado)
+🎥・Streamer              (violeta/rosa, mostrar por separado)
+💎・Co-Owner
+🛡️・Admin
+🔨・Moderador
+💜・Subscriber
+⭐・VIP
+✅・Miembro
+🔔・Avisos de directo
+roles visuales de edad / país / rango
+@everyone
+```
+
+El bot intenta colocar automáticamente `🔴・EN DIRECTO` y `🎥・Streamer` justo debajo de su propio rol. `👑・Owner` debe permanecer arriba del bot y configurarse manualmente sin color/hoist si se quiere que EN DIRECTO/Streamer controlen el color y la sección lateral.
