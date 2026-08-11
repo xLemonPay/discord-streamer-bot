@@ -2,12 +2,14 @@ import os
 import asyncio
 import io
 import re
+import time
 from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
+import aiohttp
 from aiohttp import web
 
 load_dotenv()
@@ -17,8 +19,474 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)
 PORT = int(os.getenv("PORT", "8000") or 8000)
 ENABLE_MESSAGE_LOGS = os.getenv("ENABLE_MESSAGE_LOGS", "false").strip().lower() in {"1", "true", "yes", "on"}
 
+# Twitch: detección automática mediante la API oficial (polling).
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "").strip()
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
+TWITCH_CHANNEL = os.getenv("TWITCH_CHANNEL", "").strip().lstrip("@").lower()
+STREAMER_DISCORD_ID = int(os.getenv("STREAMER_DISCORD_ID", "0") or 0)
+TWITCH_POLL_SECONDS = max(30, int(os.getenv("TWITCH_POLL_SECONDS", "60") or 60))
+TWITCH_OFFLINE_DELETE_DELAY = max(0, int(os.getenv("TWITCH_OFFLINE_DELETE_DELAY", "300") or 300))
+TWITCH_ENABLED = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_CHANNEL)
+
 # ──────────────────────────────────────────────────────────────────────────────
 # NOMBRES
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TWITCH — DETECCIÓN AUTOMÁTICA DE DIRECTOS
+# ──────────────────────────────────────────────────────────────────────────────
+
+_twitch_app_token: Optional[str] = None
+_twitch_token_expires_at: float = 0.0
+_twitch_was_live: Optional[bool] = None
+_twitch_last_stream_id: Optional[str] = None
+_twitch_delete_task: Optional[asyncio.Task] = None
+
+
+def twitch_missing_config() -> list[str]:
+    missing = []
+    if not TWITCH_CLIENT_ID:
+        missing.append("TWITCH_CLIENT_ID")
+    if not TWITCH_CLIENT_SECRET:
+        missing.append("TWITCH_CLIENT_SECRET")
+    if not TWITCH_CHANNEL:
+        missing.append("TWITCH_CHANNEL")
+    return missing
+
+
+def twitch_url() -> str:
+    return f"https://www.twitch.tv/{TWITCH_CHANNEL}" if TWITCH_CHANNEL else "https://www.twitch.tv/"
+
+
+def twitch_streamer_members(guild: discord.Guild) -> list[discord.Member]:
+    """Localiza a la streamer por ID opcional o por el rol 🎥・Streamer."""
+    if STREAMER_DISCORD_ID:
+        member = guild.get_member(STREAMER_DISCORD_ID)
+        if member is not None:
+            return [member]
+
+    role = find_role(guild, ROLE_STREAMER)
+    return list(role.members) if role is not None else []
+
+
+async def twitch_session() -> aiohttp.ClientSession:
+    session = getattr(bot, "twitch_session", None)
+    if session is None or session.closed:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+        bot.twitch_session = session
+    return session
+
+
+async def get_twitch_app_token(force_refresh: bool = False) -> str:
+    """Obtiene y cachea un App Access Token con Client Credentials."""
+    global _twitch_app_token, _twitch_token_expires_at
+
+    if not TWITCH_ENABLED:
+        raise RuntimeError("Twitch no está configurado")
+
+    now = time.time()
+    if (
+        not force_refresh
+        and _twitch_app_token
+        and now < (_twitch_token_expires_at - 60)
+    ):
+        return _twitch_app_token
+
+    session = await twitch_session()
+    async with session.post(
+        "https://id.twitch.tv/oauth2/token",
+        params={
+            "client_id": TWITCH_CLIENT_ID,
+            "client_secret": TWITCH_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        },
+    ) as response:
+        data = await response.json(content_type=None)
+        if response.status != 200:
+            raise RuntimeError(
+                f"Twitch OAuth devolvió HTTP {response.status}: {data}"
+            )
+
+    _twitch_app_token = data["access_token"]
+    _twitch_token_expires_at = now + int(data.get("expires_in", 3600))
+    return _twitch_app_token
+
+
+async def fetch_twitch_stream() -> Optional[dict]:
+    """Devuelve el stream actual del canal o None si está offline."""
+    token = await get_twitch_app_token()
+    session = await twitch_session()
+
+    async def request(current_token: str):
+        return await session.get(
+            "https://api.twitch.tv/helix/streams",
+            params={"user_login": TWITCH_CHANNEL},
+            headers={
+                "Authorization": f"Bearer {current_token}",
+                "Client-Id": TWITCH_CLIENT_ID,
+            },
+        )
+
+    response = await request(token)
+    if response.status == 401:
+        response.release()
+        token = await get_twitch_app_token(force_refresh=True)
+        response = await request(token)
+
+    async with response:
+        data = await response.json(content_type=None)
+        if response.status != 200:
+            raise RuntimeError(
+                f"Twitch Get Streams devolvió HTTP {response.status}: {data}"
+            )
+
+    streams = data.get("data") or []
+    return streams[0] if streams else None
+
+
+async def ensure_twitch_roles(guild: discord.Guild) -> tuple[discord.Role, discord.Role]:
+    no_perms = discord.Permissions.none()
+    live_role = await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
+    notify_role = await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
+    return live_role, notify_role
+
+
+async def ensure_twitch_notify_panel(guild: discord.Guild) -> Optional[discord.Message]:
+    channel = find_text(guild, CH_ROLES)
+    if channel is None:
+        return None
+
+    await ensure_twitch_roles(guild)
+    return await ensure_reaction_role_panel(
+        channel,
+        ROLE_PANEL_NOTIFY_TITLE,
+        (
+            "↳ **¿Querés que Discord te avise cuando empiece el stream?**\n\n"
+            "🔔 ─ reaccioná para recibir el rol de avisos.\n\n"
+            "Podés quitar la reacción cuando quieras para dejar de recibir menciones."
+        ),
+        STREAM_NOTIFY_REACTION_ROLES,
+    )
+
+
+def twitch_live_channel_overwrites(guild: discord.Guild) -> dict:
+    everyone = guild.default_role
+    member = find_role(guild, ROLE_MEMBER)
+    streamer = find_role(guild, ROLE_STREAMER)
+    owner = find_role(guild, ROLE_OWNER)
+    coowner = find_role(guild, ROLE_COOWNER)
+    admin = find_role(guild, ROLE_ADMIN)
+    mod = find_role(guild, ROLE_MOD)
+
+    ow = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+    }
+
+    normal = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        add_reactions=True,
+        read_message_history=True,
+        attach_files=True,
+        embed_links=True,
+        use_external_emojis=True,
+        use_external_stickers=True,
+    )
+
+    for role in (member, streamer, owner, coowner, admin, mod):
+        if role is not None:
+            ow[role] = normal
+    return ow
+
+
+async def ensure_live_channel(guild: discord.Guild, stream: dict) -> discord.TextChannel:
+    channel = find_text(guild, CH_LIVE)
+    category = find_category(guild, CAT_COMMUNITY) or find_category(guild, CAT_INFO)
+    if category is None:
+        raise RuntimeError("No encuentro la categoría de COMUNIDAD o INFORMACIÓN")
+
+    title = (stream.get("title") or "Directo en Twitch").strip()
+    game = (stream.get("game_name") or "Sin categoría").strip()
+    topic = f"🔴 EN DIRECTO • {game} • {title}"[:1024]
+    overwrites = twitch_live_channel_overwrites(guild)
+
+    if channel is None:
+        channel = await guild.create_text_channel(
+            CH_LIVE,
+            category=category,
+            overwrites=overwrites,
+            topic=topic,
+            reason="La streamer empezó directo en Twitch",
+        )
+    elif channel.topic != topic or channel.category_id != category.id:
+        # Solo edita cuando cambió el título/juego o la categoría. Evita gastar
+        # requests de Discord en cada consulta de Twitch.
+        await channel.edit(
+            category=category,
+            topic=topic,
+            reason="Sincronización del directo de Twitch",
+        )
+    return channel
+
+
+def twitch_embed(stream: dict) -> discord.Embed:
+    display_name = stream.get("user_name") or TWITCH_CHANNEL
+    title = stream.get("title") or "Estamos en directo"
+    game = stream.get("game_name") or "Sin categoría"
+    viewers = stream.get("viewer_count", 0)
+    stream_id = str(stream.get("id") or "")
+
+    embed = discord.Embed(
+        title=f"🔴 {display_name} está EN DIRECTO",
+        url=twitch_url(),
+        description=f"**{safe_text(title, 500)}**",
+        colour=discord.Colour.red(),
+    )
+    embed.add_field(name="🎮 Categoría", value=safe_text(game, 100), inline=True)
+    embed.add_field(name="👀 Espectadores", value=str(viewers), inline=True)
+    started = stream.get("started_at")
+    if started:
+        embed.add_field(name="🕒 Empezó", value=started.replace("T", " ").replace("Z", " UTC"), inline=False)
+
+    thumb = stream.get("thumbnail_url")
+    if thumb:
+        thumb = thumb.replace("{width}", "1280").replace("{height}", "720")
+        embed.set_image(url=thumb)
+
+    embed.set_footer(text=f"Twitch stream ID: {stream_id}")
+    return embed
+
+
+def twitch_link_view() -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Ver en Twitch",
+            emoji="🟣",
+            style=discord.ButtonStyle.link,
+            url=twitch_url(),
+        )
+    )
+    return view
+
+
+async def stream_already_announced(channel: discord.TextChannel, stream_id: str) -> bool:
+    wanted = f"Twitch stream ID: {stream_id}"
+    try:
+        async for msg in channel.history(limit=80):
+            if msg.author != channel.guild.me or not msg.embeds:
+                continue
+            if msg.embeds[0].footer and msg.embeds[0].footer.text == wanted:
+                return True
+    except discord.Forbidden:
+        pass
+    return False
+
+
+async def send_live_announcement(guild: discord.Guild, stream: dict) -> None:
+    directos = find_text(guild, CH_STREAMS)
+    if directos is None:
+        return
+
+    stream_id = str(stream.get("id") or "")
+    if stream_id and await stream_already_announced(directos, stream_id):
+        return
+
+    notify_role = find_role(guild, ROLE_LIVE_NOTIFY)
+    mention = notify_role.mention if notify_role is not None else ""
+    changed_mentionable = False
+
+    # Hacemos el rol mencionable solo durante el envío para que la comunidad no
+    # pueda spamear @Avisos de directo el resto del tiempo.
+    if notify_role is not None and not notify_role.mentionable:
+        me = guild.me
+        if me is not None and notify_role < me.top_role:
+            try:
+                await notify_role.edit(mentionable=True, reason="Aviso automático de Twitch")
+                changed_mentionable = True
+            except discord.Forbidden:
+                pass
+
+    try:
+        await directos.send(
+            content=mention or None,
+            embed=twitch_embed(stream),
+            view=twitch_link_view(),
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[notify_role] if notify_role is not None else False,
+            ),
+        )
+    finally:
+        if changed_mentionable:
+            try:
+                await notify_role.edit(mentionable=False, reason="Fin del aviso automático de Twitch")
+            except discord.Forbidden:
+                pass
+
+
+async def add_live_role_to_streamer(guild: discord.Guild) -> int:
+    live_role = find_role(guild, ROLE_LIVE)
+    if live_role is None:
+        live_role, _ = await ensure_twitch_roles(guild)
+
+    count = 0
+    for member in twitch_streamer_members(guild):
+        if live_role not in member.roles:
+            try:
+                await member.add_roles(live_role, reason="Streamer en directo en Twitch")
+                count += 1
+            except discord.Forbidden:
+                print(f"⚠️ No pude asignar {ROLE_LIVE} a {member} por jerarquía/permisos.")
+    return count
+
+
+async def remove_live_role_from_streamer(guild: discord.Guild) -> int:
+    live_role = find_role(guild, ROLE_LIVE)
+    if live_role is None:
+        return 0
+
+    count = 0
+    for member in twitch_streamer_members(guild):
+        if live_role in member.roles:
+            try:
+                await member.remove_roles(live_role, reason="Terminó el directo de Twitch")
+                count += 1
+            except discord.Forbidden:
+                pass
+    return count
+
+
+async def delete_live_channel_later(guild_id: int) -> None:
+    global _twitch_delete_task
+    try:
+        if TWITCH_OFFLINE_DELETE_DELAY:
+            await asyncio.sleep(TWITCH_OFFLINE_DELETE_DELAY)
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return
+
+        # Antes de borrar volvemos a consultar Twitch por si reinició stream.
+        try:
+            stream = await fetch_twitch_stream()
+        except Exception as exc:
+            print(f"⚠️ No borré el canal live porque no pude verificar Twitch: {exc}")
+            return
+        if stream is not None:
+            return
+
+        channel = find_text(guild, CH_LIVE)
+        if channel is not None:
+            try:
+                await channel.delete(reason="El directo de Twitch terminó")
+            except discord.Forbidden:
+                pass
+    finally:
+        _twitch_delete_task = None
+
+
+async def handle_twitch_online(guild: discord.Guild, stream: dict) -> None:
+    global _twitch_was_live, _twitch_last_stream_id, _twitch_delete_task
+
+    stream_id = str(stream.get("id") or "")
+    first_sync = _twitch_was_live is not True or _twitch_last_stream_id != stream_id
+
+    if _twitch_delete_task is not None and not _twitch_delete_task.done():
+        _twitch_delete_task.cancel()
+        _twitch_delete_task = None
+
+    if first_sync:
+        if find_role(guild, ROLE_LIVE) is None or find_role(guild, ROLE_LIVE_NOTIFY) is None:
+            await ensure_twitch_roles(guild)
+        await ensure_twitch_notify_panel(guild)
+
+    live_channel = await ensure_live_channel(guild, stream)
+    await add_live_role_to_streamer(guild)
+
+    if first_sync:
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Streaming(
+                name=f"{stream.get('user_name') or TWITCH_CHANNEL} en Twitch",
+                url=twitch_url(),
+            ),
+        )
+
+        # Anuncia una sola vez por ID de stream, incluso si Northflank reinicia.
+        directos = find_text(guild, CH_STREAMS)
+        already = False
+        if directos is not None and stream_id:
+            already = await stream_already_announced(directos, stream_id)
+        if not already:
+            await send_live_announcement(guild, stream)
+
+        try:
+            await live_channel.send(
+                embed=twitch_embed(stream),
+                view=twitch_link_view(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            pass
+
+    _twitch_was_live = True
+    _twitch_last_stream_id = stream_id
+
+
+async def handle_twitch_offline(guild: discord.Guild) -> None:
+    global _twitch_was_live, _twitch_last_stream_id, _twitch_delete_task
+
+    was_live = _twitch_was_live is True
+    first_offline_sync = _twitch_was_live is not False
+    await remove_live_role_from_streamer(guild)
+    if first_offline_sync:
+        await bot.change_presence(status=discord.Status.online, activity=None)
+
+    live_channel = find_text(guild, CH_LIVE)
+    if live_channel is not None and (_twitch_delete_task is None or _twitch_delete_task.done()):
+        if was_live:
+            minutes = max(0, TWITCH_OFFLINE_DELETE_DELAY // 60)
+            text = "🌙 **El directo terminó.** Gracias por acompañar 💜"
+            if TWITCH_OFFLINE_DELETE_DELAY:
+                text += f"\nEste canal se cerrará automáticamente en aproximadamente {minutes or 1} minuto(s)."
+            try:
+                await live_channel.send(text)
+            except discord.Forbidden:
+                pass
+
+        _twitch_delete_task = asyncio.create_task(delete_live_channel_later(guild.id))
+
+    _twitch_was_live = False
+    _twitch_last_stream_id = None
+
+
+@tasks.loop(seconds=TWITCH_POLL_SECONDS)
+async def twitch_watch():
+    if not TWITCH_ENABLED or not GUILD_ID:
+        return
+
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+
+    try:
+        stream = await fetch_twitch_stream()
+        if stream is not None:
+            await handle_twitch_online(guild, stream)
+        else:
+            await handle_twitch_offline(guild)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"⚠️ Twitch watcher: {type(exc).__name__}: {exc}")
+
+
+@twitch_watch.before_loop
+async def before_twitch_watch():
+    await bot.wait_until_ready()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 
 ROLE_MEMBER = "✅・Miembro"
@@ -30,6 +498,8 @@ ROLE_MOD = "🔨・Moderador"
 ROLE_STREAMER = "🎥・Streamer"
 ROLE_SUB = "💜・Subscriber"
 ROLE_VIP = "⭐・VIP"
+ROLE_LIVE = "🔴・EN DIRECTO"
+ROLE_LIVE_NOTIFY = "🔔・Avisos de directo"
 
 COUNTRIES = [
     "🇵🇾・Paraguay",
@@ -79,6 +549,8 @@ VALORANT_CUSTOM_EMOJIS = {
 
 ROLE_PANEL_COUNTRY_TITLE = "🌎 Elegí tu país"
 ROLE_PANEL_RANK_TITLE = "🔫 Elegí tu rango de Valorant"
+ROLE_PANEL_NOTIFY_TITLE = "🔔 Avisos de directo"
+STREAM_NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY}
 GUIDE_PREFIX = "📌 Guía — "
 
 CAT_INFO = "╭・📌 INFORMACIÓN"
@@ -93,6 +565,8 @@ CH_RULES = "📜・reglas"
 CH_ROLES = "🎭・roles"
 CH_ANNOUNCEMENTS = "📢・anuncios"
 CH_STREAMS = "🎥・directos"
+CH_STREAMER_ONLY = "💜・aqui-solo-habla-la-streamer"
+CH_LIVE = "🔴・stream-en-vivo"
 
 CH_GENERAL = "💬・general"
 CH_MEDIA = "📸・multimedia"
@@ -356,6 +830,8 @@ async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
         return guild, message, COUNTRY_REACTION_ROLES
     if title == ROLE_PANEL_RANK_TITLE:
         return guild, message, build_rank_reaction_roles(guild)
+    if title == ROLE_PANEL_NOTIFY_TITLE:
+        return guild, message, STREAM_NOTIFY_REACTION_ROLES
     return guild, message, None
 
 
@@ -951,6 +1427,9 @@ async def health_root(request: web.Request) -> web.Response:
             "status": "ok",
             "discord_ready": discord_bot.is_ready(),
             "bot": str(discord_bot.user) if discord_bot.user else None,
+            "twitch_enabled": TWITCH_ENABLED,
+            "twitch_channel": TWITCH_CHANNEL or None,
+            "twitch_watcher_running": twitch_watch.is_running(),
         }
     )
 
@@ -977,6 +1456,14 @@ async def start_health_server(discord_bot: commands.Bot):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SetupBot(commands.Bot):
+    async def close(self):
+        if twitch_watch.is_running():
+            twitch_watch.cancel()
+        session = getattr(self, "twitch_session", None)
+        if session is not None and not session.closed:
+            await session.close()
+        await super().close()
+
     async def setup_hook(self):
         await start_health_server(self)
 
@@ -987,7 +1474,15 @@ class SetupBot(commands.Bot):
 
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
+
+            # Copiamos los comandos al servidor para que aparezcan al instante.
             self.tree.copy_global_to(guild=guild_obj)
+
+            # Limpia versiones globales antiguas del bot. Esto evita que Discord
+            # muestre dos veces /setup u otros comandos después de migraciones.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+
             await self.tree.sync(guild=guild_obj)
         else:
             await self.tree.sync()
@@ -1012,6 +1507,12 @@ async def on_ready():
     else:
         print("ℹ️ Comandos globales sincronizados. Pueden tardar en aparecer.")
 
+    if TWITCH_ENABLED:
+        if not twitch_watch.is_running():
+            twitch_watch.start()
+        print(f"🟣 Twitch activo: @{TWITCH_CHANNEL} (cada {TWITCH_POLL_SECONDS}s)")
+    else:
+        print("ℹ️ Twitch automático desactivado. Faltan: " + ", ".join(twitch_missing_config()))
 
 
 @bot.event
@@ -1081,7 +1582,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         pass
 
 
-@bot.tree.command(name="setup", description="Crea y configura la estructura completa del servidor.")
+@bot.tree.command(name="setup", description="Instalación completa inicial. Para cambios usá los comandos por sección.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def setup_server(interaction: discord.Interaction):
@@ -1147,6 +1648,8 @@ async def setup_server(interaction: discord.Interaction):
         role_streamer = await ensure_role(guild, ROLE_STREAMER, no_perms, 0xEB459E, True)
         await ensure_role(guild, ROLE_SUB, no_perms, 0x9B59B6, False)
         await ensure_role(guild, ROLE_VIP, no_perms, 0xFEE75C, False)
+        await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
+        await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
 
         # Roles visuales: 0 permisos.
         for name in COUNTRIES:
@@ -1304,6 +1807,40 @@ async def setup_server(interaction: discord.Interaction):
             "Avisos de directos y contenido de la streamer.",
         )
 
+        streamer_only_ow = {
+            everyone: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=False,
+                add_reactions=True,
+                read_message_history=True,
+            ),
+            role_member: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=False,
+                add_reactions=True,
+                read_message_history=True,
+            ),
+            role_streamer: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                add_reactions=True,
+                read_message_history=True,
+                embed_links=True,
+                attach_files=True,
+                use_external_emojis=True,
+                use_external_stickers=True,
+            ),
+            role_admin: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+            role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+        }
+        ch_streamer_only = await ensure_text_channel(
+            guild,
+            cat_info,
+            CH_STREAMER_ONLY,
+            streamer_only_ow,
+            "Canal personal: solo la streamer publica; la comunidad puede leer y reaccionar.",
+        )
+
         # ── Comunidad ─────────────────────────────────────────────────────────
         ch_general = await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
         ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
@@ -1389,6 +1926,8 @@ async def setup_server(interaction: discord.Interaction):
             rank_reaction_roles,
         )
 
+        await ensure_twitch_notify_panel(guild)
+
         ticket_panel_already = False
         async for msg in ch_commands.history(limit=30):
             if msg.author == guild.me and msg.embeds and msg.embeds[0].title == "🎫 Soporte y reportes":
@@ -1425,6 +1964,12 @@ async def setup_server(interaction: discord.Interaction):
             "Directos",
             "Canal destinado a los avisos de stream y contenido de la streamer. "
             "Más adelante puede conectarse con Twitch para publicar los directos automáticamente.",
+        )
+        await ensure_guide(
+            ch_streamer_only,
+            "Aquí solo habla la streamer",
+            "Este es el espacio personal de la streamer. La comunidad puede **leer y reaccionar**, "
+            "pero solo el rol `🎥・Streamer` puede publicar mensajes, imágenes y enlaces.",
         )
         await ensure_guide(
             ch_general,
@@ -1488,7 +2033,7 @@ async def setup_server(interaction: discord.Interaction):
         await interaction.followup.send(
             "✅ **Setup completado.**\n"
             "Creé/actualicé roles, categorías, canales, permisos, verificación, "
-            "reaction roles, guías por canal, el sistema privado de reportes y la búsqueda de grupo de Valorant.\n\n"
+            "reaction roles, guías por canal, el canal exclusivo de la streamer, el sistema privado de reportes y la búsqueda de grupo de Valorant.\n\n"
             "No borré ningún canal ni rol que ya existiera.",
             ephemeral=True,
         )
@@ -1507,6 +2052,543 @@ async def setup_server(interaction: discord.Interaction):
         )
         raise
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ACTUALIZACIONES POR SECCIÓN
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def require_admin(interaction: discord.Interaction) -> bool:
+    if interaction.guild is None:
+        return False
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        if interaction.response.is_done():
+            await interaction.followup.send("Necesitás permiso de Administrador para usar este comando.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Necesitás permiso de Administrador para usar este comando.", ephemeral=True)
+        return False
+    return True
+
+
+async def set_progress(interaction: discord.Interaction, text: str):
+    """Actualiza el mensaje efímero para que nunca quede 'pensando' sin información."""
+    try:
+        await interaction.edit_original_response(content=text)
+    except (discord.NotFound, discord.HTTPException):
+        pass
+
+
+def role_panel_line(guild: discord.Guild, emoji: str, role_name: str) -> str:
+    role = find_role(guild, role_name)
+    label = role.mention if role is not None else f"**{role_name.split('・', 1)[-1]}**"
+    return f"{emoji} ─ {label}"
+
+
+
+@bot.tree.command(name="actualizar-canales", description="Actualiza solo canales, categorías y permisos del servidor.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def update_channels_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await set_progress(interaction, "🔄 **Canales:** comprobando roles necesarios...")
+
+    role_owner = find_role(guild, ROLE_OWNER)
+    role_coowner = find_role(guild, ROLE_COOWNER)
+    role_admin = find_role(guild, ROLE_ADMIN)
+    role_mod = find_role(guild, ROLE_MOD)
+    role_member = find_role(guild, ROLE_MEMBER)
+    role_streamer = find_role(guild, ROLE_STREAMER)
+
+    required = [role_owner, role_coowner, role_admin, role_mod, role_member, role_streamer]
+    if any(role is None for role in required):
+        return await set_progress(
+            interaction,
+            "❌ Falta alguno de los roles base. Usá `/setup` únicamente para completar la instalación inicial.",
+        )
+
+    everyone = guild.default_role
+
+    verification_overwrites = {
+        everyone: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=False,
+            read_message_history=True,
+        ),
+    }
+
+    public_readonly = {
+        everyone: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=False,
+            read_message_history=True,
+        ),
+        role_owner: discord.PermissionOverwrite(send_messages=True),
+        role_coowner: discord.PermissionOverwrite(send_messages=True),
+        role_admin: discord.PermissionOverwrite(send_messages=True),
+        role_mod: discord.PermissionOverwrite(send_messages=True),
+    }
+
+    member_text = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+        role_member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+            use_external_emojis=True,
+            use_external_stickers=True,
+            create_public_threads=True,
+            send_messages_in_threads=True,
+        ),
+    }
+
+    roles_readonly = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+        role_member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=True,
+            read_message_history=True,
+        ),
+        role_owner: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+        role_coowner: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+        role_admin: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+        role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=True, add_reactions=True),
+    }
+
+    member_voice = {
+        everyone: discord.PermissionOverwrite(view_channel=False, connect=False),
+        role_member: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+        ),
+    }
+
+    staff_ow = staff_overwrites(guild, role_owner, role_coowner, role_admin, role_mod)
+
+    await set_progress(interaction, "🔄 **Canales:** actualizando categorías...")
+    cat_info = await ensure_category(guild, CAT_INFO, verification_overwrites)
+    cat_community = await ensure_category(guild, CAT_COMMUNITY, member_text)
+    cat_gaming = await ensure_category(guild, CAT_GAMING, member_text)
+    cat_voice = await ensure_category(guild, CAT_VOICE, member_voice)
+    cat_staff = await ensure_category(guild, CAT_STAFF, staff_ow)
+    await ensure_category(guild, CAT_TICKETS, staff_ow)
+
+    await set_progress(interaction, "🔄 **Canales:** actualizando INFORMACIÓN...")
+    await ensure_text_channel(guild, cat_info, CH_VERIFY, verification_overwrites, "Verificate para desbloquear el resto del servidor.")
+    await ensure_text_channel(guild, cat_info, CH_RULES, public_readonly, "Reglas y convivencia de la comunidad.")
+    await ensure_text_channel(guild, cat_info, CH_ROLES, roles_readonly, "Reaccioná con una bandera y un rango para elegir tus roles visuales.")
+    await ensure_text_channel(guild, cat_info, CH_ANNOUNCEMENTS, public_readonly, "Anuncios oficiales del servidor.")
+
+    stream_ow = dict(public_readonly)
+    stream_ow[role_streamer] = discord.PermissionOverwrite(
+        view_channel=True,
+        send_messages=True,
+        embed_links=True,
+        attach_files=True,
+    )
+    await ensure_text_channel(guild, cat_info, CH_STREAMS, stream_ow, "Avisos de directos y contenido de la streamer.")
+
+    streamer_only_ow = {
+        everyone: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=True,
+            read_message_history=True,
+        ),
+        role_member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+            add_reactions=True,
+            read_message_history=True,
+        ),
+        role_streamer: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            add_reactions=True,
+            read_message_history=True,
+            embed_links=True,
+            attach_files=True,
+            use_external_emojis=True,
+            use_external_stickers=True,
+        ),
+        role_admin: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+        role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=False),
+    }
+    await ensure_text_channel(
+        guild,
+        cat_info,
+        CH_STREAMER_ONLY,
+        streamer_only_ow,
+        "Canal personal: solo la streamer publica; la comunidad puede leer y reaccionar.",
+    )
+
+    await set_progress(interaction, "🔄 **Canales:** actualizando COMUNIDAD y GAMING...")
+    await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
+    await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
+    await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
+    await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
+    await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
+    await ensure_text_channel(guild, cat_gaming, CH_VALORANT, member_text, "Todo sobre Valorant.")
+    await ensure_text_channel(guild, cat_gaming, CH_LFG, member_text, "Buscá duo, team o gente para jugar.")
+
+    await set_progress(interaction, "🔄 **Canales:** actualizando VOZ y STAFF...")
+    await ensure_voice_channel(guild, cat_voice, VC_GENERAL, member_voice)
+    await ensure_voice_channel(guild, cat_voice, VC_GAMING, member_voice)
+    await ensure_voice_channel(guild, cat_voice, VC_VALORANT, member_voice)
+    await ensure_voice_channel(guild, cat_voice, VC_CREATE, member_voice)
+    await ensure_text_channel(guild, cat_staff, CH_STAFF, staff_ow, "Chat privado del staff.")
+    await ensure_text_channel(guild, cat_staff, CH_REPORTS, staff_ow, "Seguimiento interno de reportes.")
+    await ensure_text_channel(guild, cat_staff, CH_LOGS, staff_ow, "Logs y registros de moderación.")
+
+    await set_progress(
+        interaction,
+        "✅ **Canales y permisos actualizados.**\n"
+        "💜 También quedó listo `aqui-solo-habla-la-streamer`: la comunidad lee/reacciona y el rol `🎥・Streamer` publica.",
+    )
+
+
+@bot.tree.command(name="actualizar-roles", description="Actualiza países, rangos de Valorant y avisos de directo.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def update_roles_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await set_progress(interaction, "🔄 **Roles:** buscando el canal y los emojis...")
+
+    ch_roles = find_text(guild, CH_ROLES)
+    if ch_roles is None:
+        return await set_progress(
+            interaction,
+            "❌ No encuentro `🎭・roles`. Ejecutá `/setup` solo si todavía no hiciste la instalación inicial.",
+        )
+
+    bot_member = guild.me
+    if bot_member is None:
+        return await set_progress(interaction, "❌ No pude comprobar la jerarquía del bot.")
+
+    await ensure_twitch_roles(guild)
+
+    # Verifica qué roles puede administrar antes de tocar los paneles.
+    blocked_roles = []
+    for role_name in list(COUNTRIES) + list(VALORANT_RANKS) + [ROLE_LIVE, ROLE_LIVE_NOTIFY]:
+        role = find_role(guild, role_name)
+        if role is not None and role >= bot_member.top_role:
+            blocked_roles.append(role.name)
+
+    if blocked_roles:
+        return await set_progress(
+            interaction,
+            "❌ El rol **Server Setup** debe estar por encima de los roles visuales que asigna.\n"
+            f"Roles bloqueados: {', '.join(blocked_roles[:8])}"
+            + ("..." if len(blocked_roles) > 8 else ""),
+        )
+
+    await set_progress(interaction, "🔄 **Roles:** limpiando paneles antiguos...")
+
+    # Borra paneles viejos con selectores y elimina duplicados de los paneles actuales.
+    current_seen = set()
+    async for msg in ch_roles.history(limit=100):
+        if msg.author != guild.me or not msg.embeds:
+            continue
+
+        title = msg.embeds[0].title
+        if title in {"🌎 Roles de perfil", "🎭 Elegí tus roles"}:
+            try:
+                await msg.delete()
+            except discord.Forbidden:
+                pass
+            continue
+
+        if title in {ROLE_PANEL_COUNTRY_TITLE, ROLE_PANEL_RANK_TITLE, ROLE_PANEL_NOTIFY_TITLE}:
+            if title in current_seen:
+                try:
+                    await msg.delete()
+                except discord.Forbidden:
+                    pass
+            else:
+                current_seen.add(title)
+
+    await set_progress(interaction, "🔄 **Roles:** actualizando países...")
+    country_lines = "\n".join(
+        role_panel_line(guild, emoji, role_name)
+        for emoji, role_name in COUNTRY_REACTION_ROLES.items()
+    )
+    await ensure_reaction_role_panel(
+        ch_roles,
+        ROLE_PANEL_COUNTRY_TITLE,
+        (
+            "↳ **Seleccioná tu nacionalidad.**\n\n"
+            f"{country_lines}\n\n"
+            "Solo podés tener **un país** a la vez. Si reaccionás a otro, el bot reemplaza el anterior."
+        ),
+        COUNTRY_REACTION_ROLES,
+    )
+
+    await set_progress(interaction, "🔄 **Roles:** buscando iconos personalizados de Valorant...")
+    rank_reaction_roles = build_rank_reaction_roles(guild)
+    missing_custom = [
+        emoji_name
+        for role_name, emoji_name in VALORANT_CUSTOM_EMOJIS.items()
+        if emoji_name and discord.utils.get(guild.emojis, name=emoji_name) is None
+    ]
+
+    rank_lines = "\n".join(
+        role_panel_line(guild, emoji, role_name)
+        for emoji, role_name in rank_reaction_roles.items()
+    )
+    await ensure_reaction_role_panel(
+        ch_roles,
+        ROLE_PANEL_RANK_TITLE,
+        (
+            "↳ **Seleccioná tu rango actual.**\n\n"
+            f"{rank_lines}\n\n"
+            "Solo podés tener **un rango** a la vez. Si reaccionás a otro, el bot reemplaza el anterior."
+        ),
+        rank_reaction_roles,
+    )
+
+    await set_progress(interaction, "🔄 **Roles:** actualizando avisos de directo...")
+    await ensure_twitch_notify_panel(guild)
+
+    if missing_custom:
+        await set_progress(
+            interaction,
+            "✅ **Panel de roles actualizado.**\n"
+            "⚠️ No encontré estos emojis personalizados, así que usé un emoji normal como reemplazo temporal:\n"
+            + ", ".join(f"`:{name}:`" for name in missing_custom),
+        )
+    else:
+        await set_progress(
+            interaction,
+            "✅ **Panel de roles actualizado.**\n"
+            "🇵🇾 Países sincronizados.\n"
+            "🎖️ Rangos de Valorant sincronizados con los emojis personalizados.\n"
+            "🔔 Avisos de directo listos.",
+        )
+
+
+@bot.tree.command(name="actualizar-guias", description="Actualiza solo las guías de uso de los canales.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def update_guides_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await set_progress(interaction, "🔄 **Guías:** preparando canales...")
+
+    guides = [
+        (CH_RULES, "Reglas", "Este canal es de **solo lectura**. Acá se publican las normas oficiales de la comunidad. Leelas antes de participar y consultá al staff si alguna regla no queda clara."),
+        (CH_ANNOUNCEMENTS, "Anuncios", "Acá se publican novedades importantes del servidor, eventos, cambios y avisos del staff. Los miembros pueden leer, pero solo el staff publica."),
+        (CH_STREAMS, "Directos", "Historial de avisos automáticos de Twitch. Cuando la streamer entra en vivo, el bot publica título, categoría, miniatura y enlace; quienes tengan `🔔・Avisos de directo` reciben la mención."),
+        (CH_STREAMER_ONLY, "Aquí solo habla la streamer", "Este es el espacio personal de la streamer. La comunidad puede **leer y reaccionar**, pero solo el rol `🎥・Streamer` puede publicar mensajes, imágenes y enlaces."),
+        (CH_GENERAL, "General", "Chat principal de la comunidad. Hablá, conocé gente y compartí con respeto. Para buscar jugadores usá `🔎・busco-grupo` y para multimedia usá `📸・multimedia`."),
+        (CH_MEDIA, "Multimedia", "Compartí clips, capturas, fotos, fanarts y otro contenido multimedia. Evitá contenido NSFW, spam o material que incumpla las reglas."),
+        (CH_MEMES, "Memes", "Canal para memes y humor de la comunidad. Mantené el contenido dentro de las reglas y sin ataques personales."),
+        (CH_COMMANDS, "Comandos y soporte", "Usá este canal para las utilidades del bot. Si necesitás hablar en privado con el staff, usá el botón **Crear reporte**."),
+        (CH_GAMING, "Gaming", "Charlá sobre cualquier juego: Minecraft, cooperativos, shooters, juegos de historia y más. Valorant tiene su canal propio para mantener todo ordenado."),
+        (CH_VALORANT, "Valorant", "Canal general de Valorant: rankeds, agentes, mapas, clips, estrategias y partidas. Para armar grupo usá `🔎・busco-grupo`."),
+        (CH_LFG, "Buscar grupo — Valorant", "Usá **`/party`** acá para crear una búsqueda. Elegís modo, cuántas personas faltan y servidor.\n\nEl bot toma tu rango desde `🎭・roles` y publica una tarjeta con **Unirme**, **Salir** y **Cerrar**."),
+        (CH_STAFF, "Staff", "Chat interno del equipo de moderación. Usalo para coordinar decisiones, consultas y organización del servidor."),
+        (CH_REPORTS, "Reportes", "Registro interno de tickets: el bot avisa acá cuando un miembro abre o cierra un reporte privado."),
+        (CH_LOGS, "Logs", "Registro automático del servidor: entradas, salidas, cambios de roles/apodos y cambios de canales/roles. Los logs de contenido de mensajes son opcionales."),
+    ]
+
+    updated = 0
+    missing = []
+    total = len(guides)
+    for index, (channel_name, title, description) in enumerate(guides, start=1):
+        channel = find_text(guild, channel_name)
+        if channel is None:
+            missing.append(channel_name)
+            continue
+        await ensure_guide(channel, title, description)
+        updated += 1
+        if index in {3, 6, 9, total}:
+            await set_progress(interaction, f"🔄 **Guías:** {index}/{total} revisadas...")
+
+    result = f"✅ **Guías actualizadas:** {updated}/{total}."
+    if missing:
+        result += "\n⚠️ No encontré: " + ", ".join(f"`{name}`" for name in missing)
+    await set_progress(interaction, result)
+
+
+@bot.tree.command(name="actualizar-tickets", description="Actualiza solo el sistema de tickets y reportes.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def update_tickets_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await set_progress(interaction, "🔄 **Tickets:** comprobando roles y canales...")
+
+    role_owner = find_role(guild, ROLE_OWNER)
+    role_coowner = find_role(guild, ROLE_COOWNER)
+    role_admin = find_role(guild, ROLE_ADMIN)
+    role_mod = find_role(guild, ROLE_MOD)
+    staff_roles = [role_owner, role_coowner, role_admin, role_mod]
+    if any(role is None for role in staff_roles):
+        return await set_progress(interaction, "❌ Falta uno de los roles de staff. Ejecutá `/setup` solo para la instalación inicial.")
+
+    ch_commands = find_text(guild, CH_COMMANDS)
+    cat_staff = find_category(guild, CAT_STAFF)
+    if ch_commands is None or cat_staff is None:
+        return await set_progress(interaction, "❌ No encuentro `🤖・comandos` o la categoría de STAFF.")
+
+    staff_ow = staff_overwrites(guild, role_owner, role_coowner, role_admin, role_mod)
+    await set_progress(interaction, "🔄 **Tickets:** actualizando categoría privada...")
+    await ensure_category(guild, CAT_TICKETS, staff_ow)
+
+    ch_reports = find_text(guild, CH_REPORTS)
+    if ch_reports is None:
+        ch_reports = await ensure_text_channel(guild, cat_staff, CH_REPORTS, staff_ow, "Seguimiento interno de reportes.")
+
+    await set_progress(interaction, "🔄 **Tickets:** actualizando panel...")
+    panel = await find_bot_embed_message(ch_commands, "🎫 Soporte y reportes")
+    embed = discord.Embed(
+        title="🎫 Soporte y reportes",
+        description=(
+            "¿Necesitás hablar con el staff o reportar un problema?\n"
+            "Tocá **Crear reporte** y el bot abrirá un canal privado que solo vos y el staff podrán ver."
+        ),
+        colour=discord.Colour.blurple(),
+    )
+    if panel is None:
+        await ch_commands.send(embed=embed, view=TicketPanelView())
+    else:
+        await panel.edit(embed=embed, view=TicketPanelView())
+
+    await ensure_guide(ch_reports, "Reportes", "Registro interno de tickets: el bot avisa acá cuando un miembro abre o cierra un reporte privado.")
+    await set_progress(interaction, "✅ **Tickets actualizados.** El panel y la categoría privada están listos.")
+
+
+
+
+@bot.tree.command(name="actualizar-twitch", description="Configura y comprueba la automatización de Twitch.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def update_twitch_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    missing = twitch_missing_config()
+    if missing:
+        return await set_progress(
+            interaction,
+            "❌ **Twitch todavía no tiene credenciales.**\n"
+            "Agregá en Northflank: " + ", ".join(f"`{name}`" for name in missing) +
+            "\nDespués reiniciá el servicio y ejecutá `/actualizar-twitch` otra vez."
+        )
+
+    await set_progress(interaction, "🔄 **Twitch:** creando/comprobando roles y panel de avisos...")
+    try:
+        live_role, notify_role = await ensure_twitch_roles(guild)
+        await ensure_twitch_notify_panel(guild)
+    except discord.Forbidden:
+        return await set_progress(
+            interaction,
+            "❌ No puedo administrar los roles de Twitch. Poné **Server Setup** por encima de "
+            f"`{ROLE_LIVE}` y `{ROLE_LIVE_NOTIFY}`."
+        )
+
+    me = guild.me
+    blocked = [role.name for role in (live_role, notify_role) if me is not None and role >= me.top_role]
+    if blocked:
+        return await set_progress(
+            interaction,
+            "❌ El rol del bot debe quedar por encima de: " + ", ".join(blocked)
+        )
+
+    await set_progress(interaction, f"🔄 **Twitch:** consultando `@{TWITCH_CHANNEL}`...")
+    try:
+        stream = await fetch_twitch_stream()
+    except Exception as exc:
+        return await set_progress(
+            interaction,
+            "❌ Twitch rechazó la conexión. Revisá Client ID/Secret.\n"
+            f"Detalle: `{type(exc).__name__}: {str(exc)[:500]}`"
+        )
+
+    if not twitch_watch.is_running():
+        twitch_watch.start()
+
+    if stream is not None:
+        await handle_twitch_online(guild, stream)
+        await set_progress(
+            interaction,
+            "✅ **Twitch funcionando.**\n"
+            f"🔴 `@{TWITCH_CHANNEL}` está EN DIRECTO ahora.\n"
+            f"✅ `{CH_LIVE}` sincronizado.\n"
+            f"✅ `{ROLE_LIVE}` asignado a la streamer.\n"
+            f"✅ El bot revisará Twitch cada {TWITCH_POLL_SECONDS} segundos."
+        )
+    else:
+        await handle_twitch_offline(guild)
+        await set_progress(
+            interaction,
+            "✅ **Twitch funcionando.**\n"
+            f"⚫ `@{TWITCH_CHANNEL}` está offline ahora.\n"
+            f"✅ `{ROLE_LIVE}` se asignará automáticamente al prender.\n"
+            f"✅ `{CH_LIVE}` aparecerá automáticamente al prender.\n"
+            f"✅ El bot revisará Twitch cada {TWITCH_POLL_SECONDS} segundos."
+        )
+
+
+@bot.tree.command(name="twitch-estado", description="Muestra el estado de la conexión automática con Twitch.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def twitch_status_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    missing = twitch_missing_config()
+    if missing:
+        return await interaction.response.send_message(
+            "❌ Twitch no está configurado. Faltan: " + ", ".join(f"`{name}`" for name in missing),
+            ephemeral=True,
+        )
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        stream = await fetch_twitch_stream()
+    except Exception as exc:
+        return await set_progress(interaction, f"❌ Error consultando Twitch: `{type(exc).__name__}: {str(exc)[:500]}`")
+
+    live_channel = find_text(interaction.guild, CH_LIVE)
+    live_role = find_role(interaction.guild, ROLE_LIVE)
+    streamer_members = twitch_streamer_members(interaction.guild)
+    role_active = bool(live_role and any(live_role in member.roles for member in streamer_members))
+
+    lines = [
+        "✅ **Integración de Twitch conectada**",
+        f"Canal: `@{TWITCH_CHANNEL}`",
+        f"Estado Twitch: {'🔴 EN DIRECTO' if stream else '⚫ Offline'}",
+        f"Canal temporal: {'✅ existe' if live_channel else '— no existe'}",
+        f"Rol EN DIRECTO: {'✅ activo' if role_active else '— inactivo'}",
+        f"Chequeo: cada {TWITCH_POLL_SECONDS}s",
+    ]
+    await set_progress(interaction, "\n".join(lines))
 
 
 @bot.tree.command(name="party", description="Buscá gente para jugar Valorant.")
