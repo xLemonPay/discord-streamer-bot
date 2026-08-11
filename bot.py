@@ -41,6 +41,10 @@ _twitch_was_live: Optional[bool] = None
 _twitch_last_stream_id: Optional[str] = None
 _twitch_delete_task: Optional[asyncio.Task] = None
 
+# Mientras esta bandera está activa, el watcher real de Twitch no modifica
+# el estado simulado. /twitch-fin-prueba vuelve a sincronizar con Twitch real.
+_twitch_test_mode: bool = False
+
 
 def twitch_missing_config() -> list[str]:
     missing = []
@@ -269,6 +273,55 @@ def twitch_link_view() -> discord.ui.View:
     return view
 
 
+def twitch_test_stream() -> dict:
+    """Datos ficticios para previsualizar/probar Twitch sin prender el canal real."""
+    display_name = TWITCH_CHANNEL or "Streamer"
+    return {
+        "id": "TEST-STREAM",
+        "user_name": display_name,
+        "title": "Rankeds de Valorant 💜 — vista previa del directo",
+        "game_name": "VALORANT",
+        "viewer_count": 123,
+        "started_at": discord.utils.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # No usamos una miniatura externa inventada: en un directo real Twitch
+        # entregará la miniatura automáticamente.
+        "thumbnail_url": "",
+    }
+
+
+def twitch_test_embed(stream: Optional[dict] = None) -> discord.Embed:
+    stream = stream or twitch_test_stream()
+    embed = twitch_embed(stream)
+    embed.title = f"🧪 PRUEBA • {embed.title}"
+    embed.add_field(
+        name="🧪 Simulación",
+        value="Este mensaje es una prueba. La streamer no está necesariamente en directo.",
+        inline=False,
+    )
+    embed.set_footer(text="Vista previa del sistema automático de Twitch")
+    return embed
+
+
+async def sync_real_twitch_after_test(guild: discord.Guild) -> str:
+    """Tras una simulación, restaura el estado real consultando Twitch."""
+    if not TWITCH_ENABLED:
+        await bot.change_presence(status=discord.Status.online, activity=None)
+        return "Twitch real no está configurado; se restauró el estado normal del bot."
+
+    try:
+        stream = await fetch_twitch_stream()
+    except Exception as exc:
+        await bot.change_presence(status=discord.Status.online, activity=None)
+        return f"No pude volver a consultar Twitch: {type(exc).__name__}: {str(exc)[:250]}"
+
+    if stream is not None:
+        await handle_twitch_online(guild, stream)
+        return f"`@{TWITCH_CHANNEL}` está realmente EN DIRECTO y quedó sincronizado."
+
+    await handle_twitch_offline(guild)
+    return f"`@{TWITCH_CHANNEL}` está realmente offline y quedó sincronizado."
+
+
 async def stream_already_announced(channel: discord.TextChannel, stream_id: str) -> bool:
     wanted = f"Twitch stream ID: {stream_id}"
     try:
@@ -463,6 +516,8 @@ async def handle_twitch_offline(guild: discord.Guild) -> None:
 
 @tasks.loop(seconds=TWITCH_POLL_SECONDS)
 async def twitch_watch():
+    if _twitch_test_mode:
+        return
     if not TWITCH_ENABLED or not GUILD_ID:
         return
 
@@ -2586,9 +2641,161 @@ async def twitch_status_command(interaction: discord.Interaction):
         f"Estado Twitch: {'🔴 EN DIRECTO' if stream else '⚫ Offline'}",
         f"Canal temporal: {'✅ existe' if live_channel else '— no existe'}",
         f"Rol EN DIRECTO: {'✅ activo' if role_active else '— inactivo'}",
+        f"Modo de prueba: {'🧪 ACTIVO' if _twitch_test_mode else '— inactivo'}",
         f"Chequeo: cada {TWITCH_POLL_SECONDS}s",
     ]
     await set_progress(interaction, "\n".join(lines))
+
+
+@bot.tree.command(name="twitch-preview", description="Muestra una vista previa privada del aviso de Twitch.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def twitch_preview_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+
+    stream = twitch_test_stream()
+    await interaction.response.send_message(
+        content="🧪 **Vista previa privada.** No crea canales, no da roles y no menciona a nadie.",
+        embed=twitch_test_embed(stream),
+        view=twitch_link_view(),
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@bot.tree.command(name="twitch-simular", description="Simula un directo completo sin prender Twitch.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def twitch_simulate_command(interaction: discord.Interaction):
+    global _twitch_test_mode, _twitch_delete_task
+
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if _twitch_test_mode:
+        return await set_progress(
+            interaction,
+            "🧪 Ya hay una simulación activa. Usá `/twitch-fin-prueba` antes de iniciar otra."
+        )
+
+    _twitch_test_mode = True
+
+    # Evita que una eliminación pendiente del canal real/offline se dispare
+    # durante la demostración.
+    if _twitch_delete_task is not None and not _twitch_delete_task.done():
+        _twitch_delete_task.cancel()
+        _twitch_delete_task = None
+
+    try:
+        await set_progress(interaction, "🧪 **Twitch prueba:** preparando roles...")
+        await ensure_twitch_roles(guild)
+        await ensure_twitch_notify_panel(guild)
+
+        await set_progress(interaction, "🧪 **Twitch prueba:** creando el canal temporal...")
+        stream = twitch_test_stream()
+        live_channel = await ensure_live_channel(guild, stream)
+
+        assigned = await add_live_role_to_streamer(guild)
+
+        await bot.change_presence(
+            status=discord.Status.online,
+            activity=discord.Streaming(
+                name=f"{stream.get('user_name') or 'Streamer'} en Twitch [PRUEBA]",
+                url=twitch_url(),
+            ),
+        )
+
+        # En la prueba NO mencionamos el rol de avisos para no molestar a nadie.
+        directos = find_text(guild, CH_STREAMS)
+        if directos is not None:
+            await directos.send(
+                content="🧪 **SIMULACIÓN DE DIRECTO — no es un stream real y nadie fue mencionado.**",
+                embed=twitch_test_embed(stream),
+                view=twitch_link_view(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        await live_channel.send(
+            content="🧪 **Canal temporal creado en modo de prueba.**",
+            embed=twitch_test_embed(stream),
+            view=twitch_link_view(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+        streamer_note = (
+            f"✅ `{ROLE_LIVE}` asignado a {assigned} streamer."
+            if assigned
+            else f"⚠️ No encontré a nadie con `{ROLE_STREAMER}` para asignarle `{ROLE_LIVE}`."
+        )
+
+        await set_progress(
+            interaction,
+            "✅ **Simulación de Twitch activa.**\n"
+            f"✅ `{CH_LIVE}` creado/sincronizado.\n"
+            f"{streamer_note}\n"
+            f"✅ Se publicó un aviso de prueba en `{CH_STREAMS}` sin mencionar a nadie.\n"
+            "✅ El estado del bot muestra Streaming [PRUEBA].\n\n"
+            "Cuando termines de mirar, usá `/twitch-fin-prueba`."
+        )
+    except Exception as exc:
+        _twitch_test_mode = False
+        await bot.change_presence(status=discord.Status.online, activity=None)
+        await set_progress(
+            interaction,
+            f"❌ La simulación falló: `{type(exc).__name__}: {str(exc)[:500]}`"
+        )
+
+
+@bot.tree.command(name="twitch-fin-prueba", description="Termina la simulación de Twitch y restaura el estado real.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def twitch_end_test_command(interaction: discord.Interaction):
+    global _twitch_test_mode
+
+    if not await require_admin(interaction):
+        return
+
+    guild = interaction.guild
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    if not _twitch_test_mode:
+        return await set_progress(
+            interaction,
+            "ℹ️ No hay ninguna simulación de Twitch activa."
+        )
+
+    await set_progress(interaction, "🧪 **Twitch prueba:** limpiando la simulación...")
+
+    # Primero desactivamos la bandera. A partir de aquí el watcher puede volver
+    # a trabajar con Twitch real.
+    _twitch_test_mode = False
+
+    await remove_live_role_from_streamer(guild)
+
+    live_channel = find_text(guild, CH_LIVE)
+    if live_channel is not None:
+        try:
+            await live_channel.delete(reason="Fin de la simulación de Twitch")
+        except discord.Forbidden:
+            return await set_progress(
+                interaction,
+                f"❌ No pude borrar `{CH_LIVE}`. Revisá el permiso Gestionar canales."
+            )
+
+    await bot.change_presence(status=discord.Status.online, activity=None)
+
+    result = await sync_real_twitch_after_test(guild)
+    await set_progress(
+        interaction,
+        "✅ **Simulación terminada.**\n"
+        f"✅ `{ROLE_LIVE}` de prueba retirado.\n"
+        f"✅ Canal temporal de prueba eliminado.\n"
+        f"🔄 Estado real: {result}"
+    )
 
 
 @bot.tree.command(name="party", description="Buscá gente para jugar Valorant.")
