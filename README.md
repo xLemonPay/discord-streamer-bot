@@ -249,7 +249,35 @@ Muestra:
 - online/offline;
 - existencia del canal temporal;
 - estado del rol EN DIRECTO;
+- modo de prueba;
 - frecuencia de consulta.
+
+### Pruebas sin prender Twitch
+
+```text
+/twitch-preview
+```
+
+Muestra una **vista previa privada** del anuncio. No crea canales, no asigna roles y no menciona a nadie.
+
+```text
+/twitch-simular
+```
+
+Simula el flujo completo:
+
+- crea `🔴・stream-en-vivo`;
+- asigna `🔴・EN DIRECTO` a quien tenga `🎥・Streamer`;
+- publica un aviso marcado como **SIMULACIÓN** en `🎥・directos`;
+- no menciona `🔔・Avisos de directo` durante la prueba;
+- cambia la presencia del bot a Streaming `[PRUEBA]`;
+- pausa temporalmente el watcher real para que no desarme la simulación.
+
+```text
+/twitch-fin-prueba
+```
+
+Termina la simulación, quita `🔴・EN DIRECTO`, elimina el canal temporal y vuelve a consultar Twitch real para restaurar inmediatamente el estado correcto.
 
 ---
 
@@ -297,6 +325,18 @@ Configura y prueba Twitch.
 
 Comprueba el estado actual de Twitch.
 
+### `/twitch-preview`
+
+Vista previa privada del anuncio de Twitch.
+
+### `/twitch-simular`
+
+Simula un directo completo sin prender Twitch.
+
+### `/twitch-fin-prueba`
+
+Finaliza la simulación y restaura Twitch real.
+
 ### `/party`
 
 Comando de usuario para buscar grupo de Valorant.
@@ -319,7 +359,7 @@ Comando de usuario para buscar grupo de Valorant.
 │・📸・multimedia
 │・😂・memes
 │・🤖・comandos
-╰・🔴・stream-en-vivo      ← solo existe durante stream
+╰・🔴・stream-en-vivo      ← solo existe durante stream o simulación
 
 ╭・🎮 GAMING
 │・🎮・gaming
@@ -358,7 +398,7 @@ Comando de usuario para buscar grupo de Valorant.
 - `🎥・Streamer`
 - `💜・Subscriber`
 - `⭐・VIP`
-- `🔴・EN DIRECTO` — temporal mientras Twitch está live.
+- `🔴・EN DIRECTO` — temporal mientras Twitch está live o durante una simulación.
 - `🔔・Avisos de directo` — optativo para recibir menciones.
 
 Países y rangos de Valorant son visuales y no tienen permisos administrativos.
@@ -443,6 +483,8 @@ README.md            Manual completo
 - guías → `/actualizar-guias`
 - tickets → `/actualizar-tickets`
 - Twitch → `/actualizar-twitch`
+- vista previa Twitch → `/twitch-preview`
+- simulación Twitch → `/twitch-simular` y luego `/twitch-fin-prueba`
 - instalación completa → `/setup`
 
 ---
