@@ -66,7 +66,7 @@ Al detectar que `TWITCH_CHANNEL` está live:
 Al terminar, quita el rol y elimina los canales temporales después de `TWITCH_OFFLINE_DELETE_DELAY`.
 
 ### Clips automáticos
-El bot consulta Twitch cada `TWITCH_CLIPS_POLL_SECONDS` segundos y revisa una ventana reciente de `TWITCH_CLIPS_LOOKBACK_MINUTES` minutos. Antes de publicar revisa los mensajes del canal por el ID del clip, por lo que un reinicio no debería duplicar clips ya publicados.
+El bot consulta Twitch cada `TWITCH_CLIPS_POLL_SECONDS` segundos y revisa una ventana reciente de `TWITCH_CLIPS_LOOKBACK_MINUTES` minutos. Antes de publicar revisa los mensajes del canal por el ID del clip, por lo que un reinicio no duplica clips ya publicados. Los paneles, guías e invitación también se buscan y reutilizan; al arrancar el bot limpia copias antiguas en lugar de volver a enviarlas.
 
 Cada clip muestra título, creador, vistas, miniatura y botón **Ver clip**.
 
@@ -124,7 +124,7 @@ TWITCH_CHANNEL=
 STREAMER_DISCORD_ID=0
 TWITCH_POLL_SECONDS=60
 TWITCH_OFFLINE_DELETE_DELAY=300
-TWITCH_CLIPS_POLL_SECONDS=120
+TWITCH_CLIPS_POLL_SECONDS=60
 TWITCH_CLIPS_LOOKBACK_MINUTES=20
 ```
 

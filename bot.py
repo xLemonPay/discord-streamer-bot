@@ -28,7 +28,7 @@ TWITCH_CHANNEL = os.getenv("TWITCH_CHANNEL", "").strip().lstrip("@").lower()
 STREAMER_DISCORD_ID = int(os.getenv("STREAMER_DISCORD_ID", "0") or 0)
 TWITCH_POLL_SECONDS = max(30, int(os.getenv("TWITCH_POLL_SECONDS", "60") or 60))
 TWITCH_OFFLINE_DELETE_DELAY = max(0, int(os.getenv("TWITCH_OFFLINE_DELETE_DELAY", "300") or 300))
-TWITCH_CLIPS_POLL_SECONDS = max(60, int(os.getenv("TWITCH_CLIPS_POLL_SECONDS", "120") or 120))
+TWITCH_CLIPS_POLL_SECONDS = max(60, int(os.getenv("TWITCH_CLIPS_POLL_SECONDS", "60") or 60))
 TWITCH_CLIPS_LOOKBACK_MINUTES = max(5, int(os.getenv("TWITCH_CLIPS_LOOKBACK_MINUTES", "20") or 20))
 TWITCH_ENABLED = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_CHANNEL)
 
@@ -1224,27 +1224,81 @@ async def get_or_create_invite_url(guild: discord.Guild, target: discord.TextCha
         return None
 
 
+async def _bot_embed_messages(
+    channel: discord.TextChannel,
+    title: str,
+    limit: int = 500,
+) -> list[discord.Message]:
+    """Busca mensajes embed del propio bot por título, del más nuevo al más viejo."""
+    me_id = bot.user.id if bot.user is not None else (channel.guild.me.id if channel.guild.me else None)
+    if me_id is None:
+        return []
+
+    found: list[discord.Message] = []
+    try:
+        async for msg in channel.history(limit=limit):
+            if (
+                msg.author.id == me_id
+                and msg.embeds
+                and msg.embeds[0].title == title
+            ):
+                found.append(msg)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return found
+
+
+async def find_bot_embed_message(
+    channel: discord.TextChannel,
+    title: str,
+    limit: int = 500,
+    delete_duplicates: bool = True,
+) -> Optional[discord.Message]:
+    """Devuelve un único mensaje del sistema y, por defecto, limpia duplicados."""
+    matches = await _bot_embed_messages(channel, title, limit=limit)
+    if not matches:
+        return None
+
+    # history() devuelve primero el más nuevo. Conservamos ese y borramos copias viejas.
+    keep = matches[0]
+    if delete_duplicates and len(matches) > 1:
+        for duplicate in matches[1:]:
+            try:
+                await duplicate.delete()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+    return keep
+
+
 async def ensure_invite_message(guild: discord.Guild) -> None:
+    """Crea o edita UNA sola tarjeta de invitación. Nunca la duplica al reconectar."""
     channel = find_text(guild, CH_INVITE)
     verify_channel = find_text(guild, CH_VERIFY)
     if channel is None or verify_channel is None:
         return
+
     url = await get_or_create_invite_url(guild, verify_channel)
     description = (
         "¿Conocés a alguien que disfrutaría de la comunidad? 💜\n\n"
-        + (f"### 🔗 {url}\n\nCompartí este enlace para invitarlo al servidor." if url else "⚠️ No pude crear la invitación. Dale al bot el permiso **Crear invitación** o configurá `DISCORD_INVITE_URL` en Northflank.")
+        + (
+            f"### 🔗 {url}\n\nCompartí este enlace para invitarlo al servidor."
+            if url
+            else "⚠️ No pude crear la invitación. Dale al bot el permiso **Crear invitación** "
+                 "o configurá `DISCORD_INVITE_URL` en Northflank."
+        )
     )
     title = "💜 Invitá a tus amigos"
-    message = await find_bot_embed_message(channel, title)
     embed = discord.Embed(title=title, description=description, colour=discord.Colour.purple())
+
+    # Escanea bastante historial y elimina cualquier copia anterior antes de decidir crear.
+    message = await find_bot_embed_message(channel, title, limit=500, delete_duplicates=True)
     if message is None:
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     else:
         try:
-            await message.edit(embed=embed)
-        except discord.Forbidden:
+            await message.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             pass
-
 
 
 async def ensure_guide(
@@ -1253,30 +1307,19 @@ async def ensure_guide(
     description: str,
     colour: discord.Colour = discord.Colour.blurple(),
 ) -> discord.Message:
-    """Crea o actualiza una guía del bot sin duplicarla al repetir /setup."""
+    """Crea o actualiza una sola guía; limpia copias antiguas si las hubiera."""
     full_title = f"{GUIDE_PREFIX}{title}"
-    async for msg in channel.history(limit=60):
-        if msg.author == channel.guild.me and msg.embeds and msg.embeds[0].title == full_title:
-            embed = discord.Embed(title=full_title, description=description, colour=colour)
-            try:
-                await msg.edit(embed=embed)
-            except discord.Forbidden:
-                pass
-            return msg
-
     embed = discord.Embed(title=full_title, description=description, colour=colour)
+    message = await find_bot_embed_message(channel, full_title, limit=500, delete_duplicates=True)
+
+    if message is not None:
+        try:
+            await message.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+        return message
+
     return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-
-
-async def find_bot_embed_message(
-    channel: discord.TextChannel,
-    title: str,
-    limit: int = 80,
-) -> Optional[discord.Message]:
-    async for msg in channel.history(limit=limit):
-        if msg.author == channel.guild.me and msg.embeds and msg.embeds[0].title == title:
-            return msg
-    return None
 
 
 async def ensure_reaction_role_panel(
@@ -1285,8 +1328,8 @@ async def ensure_reaction_role_panel(
     description: str,
     mapping: dict[str, str],
 ) -> discord.Message:
-    """Crea/actualiza un panel de reaction roles y asegura todas las reacciones."""
-    message = await find_bot_embed_message(channel, title)
+    """Crea/actualiza UN solo panel y sincroniza sus reacciones sin duplicar mensajes."""
+    message = await find_bot_embed_message(channel, title, limit=500, delete_duplicates=True)
     embed = discord.Embed(title=title, description=description, colour=discord.Colour.blurple())
     embed.set_footer(text="Reaccioná para asignarte el rol • Quitá tu reacción para quitarlo")
 
@@ -1294,34 +1337,64 @@ async def ensure_reaction_role_panel(
         message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
     else:
         try:
-            await message.edit(embed=embed, view=None)
-        except discord.Forbidden:
+            await message.edit(embed=embed, view=None, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             pass
 
-    # Sincroniza las reacciones del panel:
-    # quita las que ya no están configuradas y agrega las nuevas.
+    # Discord agrupa una misma reacción, por lo que solo agregamos emojis realmente ausentes.
     wanted = set(mapping.keys())
-
     for reaction in list(message.reactions):
         if str(reaction.emoji) not in wanted:
             try:
                 await message.clear_reaction(reaction.emoji)
-            except (discord.Forbidden, discord.HTTPException):
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
                 pass
+
+    # Volvemos a consultar el mensaje tras editar/limpiar para tener el estado real de reacciones.
+    try:
+        message = await channel.fetch_message(message.id)
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
 
     existing = {str(reaction.emoji) for reaction in message.reactions}
     for emoji in mapping:
-        if emoji not in existing:
-            try:
-                reaction_emoji = (
-                    discord.PartialEmoji.from_str(emoji)
-                    if emoji.startswith("<")
-                    else emoji
-                )
-                await message.add_reaction(reaction_emoji)
-            except (discord.Forbidden, discord.HTTPException, ValueError):
-                pass
+        if emoji in existing:
+            continue
+        try:
+            reaction_emoji = discord.PartialEmoji.from_str(emoji) if emoji.startswith("<") else emoji
+            await message.add_reaction(reaction_emoji)
+            existing.add(emoji)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException, ValueError):
+            pass
+
     return message
+
+
+async def cleanup_duplicate_system_messages(guild: discord.Guild) -> None:
+    """Limpieza silenciosa al arrancar: no crea nada, solo elimina copias repetidas."""
+    targets: list[tuple[Optional[discord.TextChannel], list[str]]] = [
+        (
+            find_text(guild, CH_ROLES),
+            [
+                ROLE_PANEL_COUNTRY_TITLE,
+                ROLE_PANEL_AGE_TITLE,
+                ROLE_PANEL_RANK_TITLE,
+                ROLE_PANEL_GAMES_TITLE,
+                ROLE_PANEL_PLATFORM_TITLE,
+                ROLE_PANEL_NOTIFY_TITLE,
+                LEGACY_ROLE_PANEL_NOTIFY_TITLE,
+            ],
+        ),
+        (find_text(guild, CH_INVITE), ["💜 Invitá a tus amigos"]),
+        (find_text(guild, CH_VERIFY), ["✅ Verificación"]),
+        (find_text(guild, CH_COMMANDS), ["🎫 Soporte y reportes"]),
+    ]
+
+    for channel, titles in targets:
+        if channel is None:
+            continue
+        for title in titles:
+            await find_bot_embed_message(channel, title, limit=500, delete_duplicates=True)
 
 
 async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
@@ -2065,10 +2138,11 @@ async def on_ready():
         guild = bot.get_guild(GUILD_ID)
         if guild is not None:
             try:
+                await cleanup_duplicate_system_messages(guild)
                 await ensure_top_indicators(guild)
                 await ensure_invite_message(guild)
             except (discord.Forbidden, discord.HTTPException) as exc:
-                print(f"⚠️ Indicadores/invitación: {type(exc).__name__}: {exc}")
+                print(f"⚠️ Limpieza/indicadores/invitación: {type(exc).__name__}: {exc}")
 
     if TWITCH_ENABLED:
         if not twitch_watch.is_running():
@@ -2952,7 +3026,7 @@ async def update_roles_command(interaction: discord.Interaction):
 
     # Borra paneles viejos con selectores y elimina duplicados de los paneles actuales.
     current_seen = set()
-    async for msg in ch_roles.history(limit=100):
+    async for msg in ch_roles.history(limit=500):
         if msg.author != guild.me or not msg.embeds:
             continue
 
