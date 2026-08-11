@@ -1,52 +1,24 @@
-# Discord Streamer Bot — versión definitiva actual
+# Discord Streamer Bot — versión definitiva
 
-Bot personalizado para el servidor de una streamer con comunidad gaming y foco principal en Valorant.
-Está preparado para alojarse 24/7 (por ejemplo en Northflank) y mantener las funciones interactivas sin depender de una PC encendida.
+Bot personalizado para una comunidad de streamer con foco gaming/Valorant. Está pensado para ejecutarse 24/7 en Northflank.
 
-> **Estado de Twitch:** la automatización de Twitch (crear un canal temporal al prender stream y asignar `🔴・EN DIRECTO`) fue diseñada/conversada, pero **NO está activada en esta versión** porque se decidió dejarla para una etapa posterior.
-
-## Funciones actuales
+## Funciones incluidas
 
 ### ✅ Verificación
-- Canal: `✅・verificación`.
-- El bot publica un botón **Verificarme**.
-- Al pulsarlo asigna `✅・Miembro`.
-- `✅・Miembro` desbloquea Comunidad, Gaming y canales de voz.
-- La vista es persistente: sigue funcionando después de reinicios del bot.
+Canal: `✅・verificación`.
+
+El botón **Verificarme** asigna `✅・Miembro`, que desbloquea Comunidad, Gaming y Voz. La vista es persistente y sigue funcionando después de reinicios.
 
 ### 🎭 Reaction roles
 Canal: `🎭・roles`.
 
-Hay dos paneles:
+**País:** el usuario reacciona con una bandera. Solo conserva un país; elegir otro reemplaza el anterior y quitar la reacción quita el rol.
 
-**País**
-- Se elige reaccionando con una bandera.
-- Solo se conserva un país por usuario.
-- Si se reacciona a otro país, el bot quita el anterior y deja el nuevo.
-- Si se quita la reacción, se quita el rol.
+Países incluidos: Paraguay, Argentina, Brasil, Uruguay, Chile, Bolivia, Perú, Colombia, Venezuela, Ecuador, México, España y Otro.
 
-Países incluidos:
-- 🇵🇾 Paraguay
-- 🇦🇷 Argentina
-- 🇧🇷 Brasil
-- 🇺🇾 Uruguay
-- 🇨🇱 Chile
-- 🇧🇴 Bolivia
-- 🇵🇪 Perú
-- 🇨🇴 Colombia
-- 🇻🇪 Venezuela
-- 🇪🇨 Ecuador
-- 🇲🇽 México
-- 🇪🇸 España
-- 🌎 Otro
+**Rango de Valorant:** el usuario reacciona con su rango. Solo conserva un rango y cambiarlo reemplaza el anterior.
 
-**Rango de Valorant**
-- Se elige reaccionando con el icono del rango.
-- Solo se conserva un rango por usuario.
-- Cambiar la reacción reemplaza el rango anterior.
-- Quitar la reacción quita el rol.
-
-El bot busca automáticamente estos emojis personalizados del servidor **por nombre**, por lo que no hace falta guardar IDs:
+El bot busca los emojis personalizados por nombre, sin guardar IDs:
 
 - `valoranthierro`
 - `valorantbronce`
@@ -58,157 +30,128 @@ El bot busca automáticamente estos emojis personalizados del servidor **por nom
 - `valorantimmortal`
 - `valorantradiante`
 
-`Sin rango` usa `⚫`.
+`Sin rango` usa `⚫`. Si falta un emoji personalizado, `/actualizar-roles` usa temporalmente el emoji normal correspondiente.
 
-Si falta un emoji personalizado, `/actualizar-roles` usa temporalmente el emoji normal correspondiente y avisa cuál falta.
+**Avisos de directo:** el panel `🔔 Avisos de directo` permite reaccionar con 🔔 para recibir `🔔・Avisos de directo`. Al quitar la reacción se quita el rol.
 
 ### 🔎 Buscar grupo de Valorant
 Canal: `🔎・busco-grupo`.
-
-Comando:
 
 ```text
 /party modo:<modo> cupos:<1-4> servidor:<opcional>
 ```
 
-Ejemplo:
-
-```text
-/party modo:Competitivo cupos:4 servidor:Santiago
-```
-
-El bot:
-- toma automáticamente el rango visual del creador desde `🎭・roles`;
-- crea una tarjeta de búsqueda;
-- muestra jugadores actuales y cupos;
-- ofrece **✅ Unirme**;
-- ofrece **🚪 Salir**;
-- ofrece **🔒 Cerrar** al creador/staff;
-- marca el grupo como completo cuando llega al máximo;
-- conserva los botones después de reinicios.
-
-Modos disponibles incluyen Competitivo, Swiftplay, No competitivo, Premier, Deathmatch/TDM y Otro.
+El bot toma el rango del creador y publica una tarjeta con jugadores/cupos y botones **Unirme**, **Salir** y **Cerrar**. Los botones siguen funcionando después de reinicios.
 
 ### 🎫 Tickets y reportes
-En `🤖・comandos` el bot mantiene un panel **🎫 Soporte y reportes**.
-
-Al tocar **Crear reporte**:
-- crea un canal privado;
-- solo lo ve el usuario y el staff;
-- evita que el mismo usuario abra varios tickets a la vez;
-- incluye botón para cerrar;
-- al cerrar guarda un registro en `📋・reportes`.
-
-La categoría `╭・🎫 TICKETS` permanece oculta para miembros normales.
+En `🤖・comandos`, el botón **Crear reporte** abre un canal privado visible solo para el usuario y staff. Evita tickets duplicados, incluye botón de cierre y registra apertura/cierre en `📋・reportes`.
 
 ### 📜 Logs
-Canal privado de staff: `📜・logs`.
+Canal: `📜・logs`.
 
-Registra, entre otros:
-- entrada y salida de miembros;
-- cambios de apodo;
-- cambios de roles;
-- creación/eliminación de canales;
-- creación/eliminación de roles.
+Registra entradas/salidas, cambios de apodo/roles y creación/eliminación de canales y roles.
 
-Los logs de **contenido** de mensajes editados/eliminados son opcionales y están desactivados por defecto.
+Los logs de contenido de mensajes son opcionales. Para activarlos, habilitar `MESSAGE CONTENT INTENT` en Discord Developer Portal y configurar:
 
-Para activarlos:
-1. Discord Developer Portal → aplicación → Bot.
-2. Activar `MESSAGE CONTENT INTENT`.
-3. En Northflank agregar `ENABLE_MESSAGE_LOGS=true`.
-4. Reiniciar/redeployar el servicio.
+```env
+ENABLE_MESSAGE_LOGS=true
+```
 
 ### 🔊 Salas de voz temporales
 Canal: `➕・Crear sala`.
 
-Cuando un usuario entra:
-- se crea `🎮・Sala de <usuario>`;
-- el usuario es movido automáticamente;
-- el creador obtiene controles sobre su sala;
-- cuando queda vacía, el bot la elimina.
+Al entrar se crea `🎮・Sala de <usuario>`, el usuario es movido, recibe controles y el canal se elimina cuando queda vacío.
 
 ### 💜 Aquí solo habla la streamer
 Canal: `💜・aqui-solo-habla-la-streamer`.
 
-- La comunidad puede verlo, leer y reaccionar.
-- El rol `🎥・Streamer` puede publicar texto, imágenes y enlaces.
-- Admin y Moderador quedan con envío denegado por overwrite del canal.
+La comunidad puede leer y reaccionar. `🎥・Streamer` puede publicar texto, imágenes y enlaces. Admin/Moderador tienen envío denegado por overwrite. Usuarios con `Administrator` global pueden saltar overwrites por funcionamiento de Discord.
 
-**Limitación de Discord:** un usuario que tenga el permiso global `Administrator` siempre puede saltarse los overwrites de los canales. Por eso Owner/Co-Owner con Administrator técnicamente pueden escribir aunque el canal esté pensado para que solo publique la streamer.
+## 🟣 Twitch automático
 
-### 📌 Guías automáticas
-El bot puede colocar/actualizar una guía breve en cada canal para explicar su uso sin duplicar mensajes.
+La versión nueva consulta la API oficial de Twitch automáticamente. Twitch solo se activa cuando existen estas variables en Northflank:
 
-Incluye guías para:
-- reglas;
-- anuncios;
-- directos;
-- canal personal de la streamer;
-- general;
-- multimedia;
-- memes;
-- comandos/soporte;
-- gaming;
-- Valorant;
-- buscar grupo;
-- staff;
-- reportes;
-- logs.
+```env
+TWITCH_CLIENT_ID=tu_client_id
+TWITCH_CLIENT_SECRET=tu_client_secret
+TWITCH_CHANNEL=nombre_del_canal_sin_@
+```
 
-## Comandos de administración
+Opcionales:
+
+```env
+STREAMER_DISCORD_ID=0
+TWITCH_POLL_SECONDS=60
+TWITCH_OFFLINE_DELETE_DELAY=300
+```
+
+Si `STREAMER_DISCORD_ID=0`, el bot busca a quien tenga `🎥・Streamer`.
+
+### Cuando la streamer prende
+
+El bot:
+
+1. detecta que el canal de Twitch está live;
+2. crea/comprueba `🔴・EN DIRECTO`;
+3. asigna `🔴・EN DIRECTO` a la streamer;
+4. crea `🔴・stream-en-vivo` en Comunidad;
+5. publica en `🎥・directos` título, categoría, espectadores, miniatura y botón **Ver en Twitch**;
+6. menciona `🔔・Avisos de directo`;
+7. publica la tarjeta dentro del canal temporal;
+8. cambia la presencia del bot a streaming;
+9. evita anunciar dos veces el mismo stream incluso si el bot se reinicia.
+
+### Cuando termina
+
+El bot quita `🔴・EN DIRECTO`, restaura su presencia, avisa dentro de `🔴・stream-en-vivo`, espera `TWITCH_OFFLINE_DELETE_DELAY` (300 segundos = 5 minutos por defecto), vuelve a consultar Twitch y elimina el canal temporal solo si sigue offline.
+
+Si vuelve a prender durante esa espera, el canal no se elimina.
+
+### Comandos Twitch
+
+```text
+/actualizar-twitch
+```
+
+Crea/comprueba roles y panel de avisos, prueba Client ID/Secret, consulta el estado real del canal y sincroniza inmediatamente Discord.
+
+```text
+/twitch-estado
+```
+
+Muestra canal configurado, online/offline, existencia del canal temporal, estado del rol EN DIRECTO y frecuencia de consulta.
+
+## 📌 Guías automáticas
+
+`/actualizar-guias` crea o actualiza mensajes de guía sin duplicarlos en los canales principales.
+
+## Comandos administrativos
 
 ### `/setup`
-**Solo instalación inicial completa.**
-
-Crea/actualiza de una vez:
-- roles base;
-- roles visuales;
-- categorías;
-- canales;
-- permisos;
-- verificación;
-- reaction roles;
-- guías;
-- tickets;
-- estructura de Valorant.
-
-No se recomienda usarlo para cambios pequeños porque hace muchas operaciones de Discord.
+Instalación inicial completa. Crea/actualiza roles, categorías, canales, permisos, verificación, reaction roles, guías y tickets. No se recomienda para cambios pequeños.
 
 ### `/actualizar-canales`
-Actualiza únicamente:
-- categorías principales;
-- canales de texto;
-- canales de voz;
-- permisos;
-- `💜・aqui-solo-habla-la-streamer`.
-
-No reconstruye reaction roles, guías ni tickets.
+Actualiza solo categorías, canales y permisos, incluido `💜・aqui-solo-habla-la-streamer`.
 
 ### `/actualizar-roles`
-Actualiza únicamente `🎭・roles`:
-- limpia paneles viejos/duplicados;
-- sincroniza banderas;
-- detecta emojis personalizados de Valorant por nombre;
-- elimina reacciones que ya no corresponden;
-- agrega las nuevas.
-
-Muestra progreso durante el proceso para evitar quedarse simplemente en “pensando”.
+Actualiza países, rangos de Valorant, emojis personalizados y el panel `🔔 Avisos de directo`; también limpia paneles/reacciones antiguos.
 
 ### `/actualizar-guias`
-Actualiza únicamente los mensajes de guía de los canales existentes.
-No toca roles ni permisos.
+Actualiza solo las guías.
 
 ### `/actualizar-tickets`
-Actualiza únicamente:
-- categoría privada de tickets;
-- panel de Crear reporte;
-- canal interno `📋・reportes`.
+Actualiza solo la categoría/panel/reportes del sistema de tickets.
+
+### `/actualizar-twitch`
+Configura y prueba Twitch.
+
+### `/twitch-estado`
+Comprueba el estado actual de Twitch.
 
 ### `/party`
-Comando de usuario para buscar grupo de Valorant. Debe usarse en `🔎・busco-grupo`.
+Comando de usuario para buscar grupo de Valorant en `🔎・busco-grupo`.
 
-## Estructura esperada del servidor
+## Estructura esperada
 
 ```text
 ╭・📌 INFORMACIÓN
@@ -223,7 +166,8 @@ Comando de usuario para buscar grupo de Valorant. Debe usarse en `🔎・busco-g
 │・💬・general
 │・📸・multimedia
 │・😂・memes
-╰・🤖・comandos
+│・🤖・comandos
+╰・🔴・stream-en-vivo      ← solo existe durante stream
 
 ╭・🎮 GAMING
 │・🎮・gaming
@@ -245,59 +189,57 @@ Comando de usuario para buscar grupo de Valorant. Debe usarse en `🔎・busco-g
 ╰・tickets privados temporales
 ```
 
-## Roles y permisos
+## Roles
 
-### Staff
+Staff:
 - `👑・Owner`: Administrator.
 - `💎・Co-Owner`: Administrator.
-- `🛡️・Admin`: gestión de servidor/canales/roles y moderación, sin Administrator global.
-- `🔨・Moderador`: moderación de usuarios, mensajes y voz.
+- `🛡️・Admin`: gestión/moderación sin Administrator global.
+- `🔨・Moderador`: moderación.
 
-### Comunidad
-- `✅・Miembro`: rol de acceso después de verificarse.
-- `🎥・Streamer`: identidad de la streamer y permiso de publicación en sus canales.
-- `💜・Subscriber`: visual.
-- `⭐・VIP`: visual.
+Comunidad:
+- `✅・Miembro`
+- `🎥・Streamer`
+- `💜・Subscriber`
+- `⭐・VIP`
+- `🔴・EN DIRECTO` — temporal mientras Twitch está live.
+- `🔔・Avisos de directo` — optativo para recibir menciones.
 
-### Países y Valorant
-Son roles visuales con **0 permisos administrativos**.
+Países y rangos son visuales y no tienen permisos administrativos.
 
-## Jerarquía del bot
-El rol del bot (`Server Setup`) debe estar por encima de cualquier rol que necesite asignar o modificar, especialmente:
-- `✅・Miembro`;
-- países;
-- rangos de Valorant.
+## Jerarquía
 
-El código evita intentar editar roles que estén por encima del propio bot para que una jerarquía como `👑・Owner > Server Setup` no rompa todo el proceso.
+`Server Setup` debe estar por encima de cualquier rol que necesite asignar/quitar: `✅・Miembro`, países, rangos, `🔴・EN DIRECTO` y `🔔・Avisos de directo`.
+
+Puede permanecer debajo de `👑・Owner`; el código evita editar roles superiores al propio bot.
 
 ## Variables de entorno
-
-Obligatorias:
 
 ```env
 DISCORD_TOKEN=token_del_bot
 GUILD_ID=id_del_servidor
-```
-
-Opcional:
-
-```env
 ENABLE_MESSAGE_LOGS=false
+
+TWITCH_CLIENT_ID=
+TWITCH_CLIENT_SECRET=
+TWITCH_CHANNEL=
+STREAMER_DISCORD_ID=0
+TWITCH_POLL_SECONDS=60
+TWITCH_OFFLINE_DELETE_DELAY=300
 ```
 
-En Northflank las variables se cargan desde **Environment**. Nunca subas el token de Discord al repositorio.
+Nunca subir secretos reales a GitHub.
 
-`PORT` es leído automáticamente del proveedor de hosting; localmente el bot usa `8000` si no existe.
+## Health check / Northflank
 
-## Health check / hosting
-El bot levanta:
+Endpoints:
 
 ```text
 GET /
 GET /health
 ```
 
-`/health` devuelve un JSON indicando si el proceso y la conexión con Discord están activos.
+La nueva versión incluye en el JSON el estado de Discord y de la integración de Twitch.
 
 El proceso se inicia con:
 
@@ -305,41 +247,30 @@ El proceso se inicia con:
 python bot.py
 ```
 
-El `Procfile` incluido contiene ese comando.
-
-## Archivos del proyecto
+## Archivos
 
 ```text
 bot.py              Código principal
-requirements.txt    Dependencias Python
-Procfile             Comando de inicio para hosting
-.env.example         Ejemplo de variables, sin secretos
-.gitignore           Evita subir .env y archivos temporales
-README.md            Documentación completa
+requirements.txt    Dependencias
+Procfile             Comando de inicio
+.env.example         Variables de ejemplo sin secretos
+.gitignore           Ignora .env/temporales
+README.md            Manual completo
 ```
 
-## Flujo recomendado para cambios
+## Flujo recomendado
 
-Después de actualizar `bot.py` en GitHub y esperar a que Northflank vuelva a `Running`:
-
-- cambiaste canales/permisos → `/actualizar-canales`;
-- cambiaste emojis/roles visuales → `/actualizar-roles`;
-- cambiaste textos/guías → `/actualizar-guias`;
-- cambiaste tickets → `/actualizar-tickets`;
-- `/setup` solo para una instalación completa.
-
-## Twitch — pendiente, no activo
-Está previsto para una etapa posterior:
-- detectar `stream.online` / `stream.offline` mediante Twitch EventSub;
-- crear `🔴・stream-en-vivo` solo mientras la streamer esté live;
-- asignar temporalmente `🔴・EN DIRECTO`;
-- publicar un aviso permanente en `🎥・directos`;
-- quitar el rol y eliminar/cerrar el canal temporal al terminar.
-
-Nada de esto se ejecuta todavía en esta versión.
+- canales/permisos → `/actualizar-canales`
+- emojis/roles → `/actualizar-roles`
+- guías → `/actualizar-guias`
+- tickets → `/actualizar-tickets`
+- Twitch → `/actualizar-twitch`
+- instalación completa → `/setup`
 
 ## Seguridad
-- Nunca publiques `DISCORD_TOKEN`.
-- `.env` está ignorado por Git.
-- No es necesario guardar IDs de los emojis de Valorant: el bot los busca por nombre.
-- El contenido de mensajes no se registra salvo que se habilite explícitamente `MESSAGE CONTENT INTENT` y `ENABLE_MESSAGE_LOGS=true`.
+
+- nunca publicar `DISCORD_TOKEN`;
+- nunca publicar `TWITCH_CLIENT_SECRET`;
+- `.env` debe permanecer fuera del repositorio;
+- el bot no registra contenido de mensajes salvo habilitación explícita;
+- los IDs de emojis de Valorant no necesitan guardarse porque se resuelven por nombre.
