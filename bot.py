@@ -1107,9 +1107,24 @@ async def ensure_voice_channel(
 
 
 
+def current_member_count(guild: discord.Guild) -> int:
+    """Devuelve una cantidad de miembros estable para el contador visual.
+
+    Discord puede tardar un instante en refrescar ``guild.member_count`` después
+    de un join/leave. Cuando la caché de miembros está disponible preferimos
+    ``len(guild.members)`` si la diferencia es pequeña; así el contador cambia
+    inmediatamente al entrar o salir alguien.
+    """
+    cached = len(guild.members)
+    reported = guild.member_count or 0
+
+    if cached > 0 and (reported == 0 or abs(cached - reported) <= 2):
+        return cached
+    return reported or cached
+
+
 def member_counter_name(guild: discord.Guild) -> str:
-    count = guild.member_count if guild.member_count is not None else len(guild.members)
-    return f"💜 {count} Miembros 💜"
+    return f"💜 {current_member_count(guild)} Miembros 💜"
 
 
 def find_member_counter_voice(guild: discord.Guild) -> Optional[discord.VoiceChannel]:
@@ -1196,8 +1211,25 @@ async def update_member_counter(guild: discord.Guild) -> None:
     if channel.name != wanted:
         try:
             await channel.edit(name=wanted, reason="Actualizar cantidad de miembros")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+        except discord.Forbidden:
+            print("⚠️ No pude actualizar el contador de miembros: falta Administrar canales.")
+        except discord.HTTPException as exc:
+            print(f"⚠️ Discord rechazó la actualización del contador: {exc}")
+
+
+@tasks.loop(seconds=60)
+async def member_counter_watch():
+    """Resincronización de respaldo por si Discord pierde un evento de entrada/salida."""
+    for guild in bot.guilds:
+        try:
+            await update_member_counter(guild)
+        except Exception as exc:
+            print(f"⚠️ Error resincronizando contador en {guild.name}: {exc}")
+
+
+@member_counter_watch.before_loop
+async def before_member_counter_watch():
+    await bot.wait_until_ready()
 
 
 async def get_or_create_invite_url(guild: discord.Guild, target: discord.TextChannel) -> Optional[str]:
@@ -2143,6 +2175,10 @@ async def on_ready():
                 await ensure_invite_message(guild)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 print(f"⚠️ Limpieza/indicadores/invitación: {type(exc).__name__}: {exc}")
+
+    if not member_counter_watch.is_running():
+        member_counter_watch.start()
+    print("👥 Contador de miembros activo (eventos + respaldo cada 60s)")
 
     if TWITCH_ENABLED:
         if not twitch_watch.is_running():
@@ -3610,6 +3646,7 @@ async def on_member_join(member: discord.Member):
         f"{member.mention} (`{member.id}`) se unió al servidor.",
         discord.Colour.green(),
     )
+    await asyncio.sleep(1)
     await update_member_counter(member.guild)
 
 
@@ -3621,6 +3658,7 @@ async def on_member_remove(member: discord.Member):
         f"**{discord.utils.escape_markdown(str(member))}** (`{member.id}`) salió del servidor.",
         discord.Colour.orange(),
     )
+    await asyncio.sleep(1)
     await update_member_counter(member.guild)
 
 
