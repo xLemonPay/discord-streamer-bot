@@ -3,8 +3,9 @@ import asyncio
 import io
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -29,8 +30,15 @@ STREAMER_DISCORD_ID = int(os.getenv("STREAMER_DISCORD_ID", "0") or 0)
 TWITCH_POLL_SECONDS = max(30, int(os.getenv("TWITCH_POLL_SECONDS", "60") or 60))
 TWITCH_OFFLINE_DELETE_DELAY = max(0, int(os.getenv("TWITCH_OFFLINE_DELETE_DELAY", "300") or 300))
 TWITCH_CLIPS_POLL_SECONDS = max(60, int(os.getenv("TWITCH_CLIPS_POLL_SECONDS", "60") or 60))
-TWITCH_CLIPS_LOOKBACK_MINUTES = max(5, int(os.getenv("TWITCH_CLIPS_LOOKBACK_MINUTES", "20") or 20))
+TWITCH_CLIPS_LOOKBACK_MINUTES = max(30, int(os.getenv("TWITCH_CLIPS_LOOKBACK_MINUTES", "180") or 180))
+STARBOARD_THRESHOLD = max(2, int(os.getenv("STARBOARD_THRESHOLD", "5") or 5))
+EVENT_TIMEZONE = os.getenv("EVENT_TIMEZONE", "America/Asuncion").strip() or "America/Asuncion"
 TWITCH_ENABLED = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_CHANNEL)
+
+try:
+    EVENT_TZ = ZoneInfo(EVENT_TIMEZONE)
+except Exception:
+    EVENT_TZ = timezone(timedelta(hours=-3))
 
 # ──────────────────────────────────────────────────────────────────────────────
 # NOMBRES
@@ -45,6 +53,12 @@ _twitch_was_live: Optional[bool] = None
 _twitch_last_stream_id: Optional[str] = None
 _twitch_delete_task: Optional[asyncio.Task] = None
 _twitch_broadcaster_id: Optional[str] = None
+_twitch_clips_last_check_at: Optional[datetime] = None
+_twitch_clips_last_error: Optional[str] = None
+_twitch_clips_last_found: int = 0
+_twitch_clips_last_published: int = 0
+_twitch_clips_last_newest_title: Optional[str] = None
+_twitch_clips_last_newest_created: Optional[str] = None
 
 # Mientras esta bandera está activa, el watcher real de Twitch no modifica
 # el estado simulado. /twitch-fin-prueba vuelve a sincronizar con Twitch real.
@@ -199,7 +213,6 @@ async def ensure_twitch_notify_panel(guild: discord.Guild) -> Optional[discord.M
     await ensure_twitch_roles(guild)
     no_perms = discord.Permissions.none()
     await ensure_role(guild, ROLE_EVENT_NOTIFY, no_perms, 0xF1C40F, False)
-    await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xFEE75C, False)
     lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in NOTIFY_REACTION_ROLES.items())
     return await ensure_reaction_role_panel(
         channel,
@@ -661,49 +674,58 @@ async def get_twitch_broadcaster_id(force_refresh: bool = False) -> str:
 
 
 async def fetch_recent_twitch_clips() -> list[dict]:
-    """Obtiene clips recientes del canal para publicarlos automáticamente."""
-    broadcaster_id = await get_twitch_broadcaster_id()
-    token = await get_twitch_app_token()
-    session = await twitch_session()
+    """Obtiene clips recientes del canal con paginación y renovación de token.
 
+    Twitch ordena los clips de broadcaster por vistas, no por fecha. Por eso
+    limitamos por una ventana reciente y paginamos hasta 300 resultados antes
+    de volver a ordenarlos por ``created_at``.
+    """
+    broadcaster_id = await get_twitch_broadcaster_id()
+    session = await twitch_session()
     now = discord.utils.utcnow()
     started = now - timedelta(minutes=TWITCH_CLIPS_LOOKBACK_MINUTES)
-    params = {
-        "broadcaster_id": broadcaster_id,
-        "started_at": started.isoformat().replace("+00:00", "Z"),
-        "ended_at": now.isoformat().replace("+00:00", "Z"),
-        "first": "100",
-    }
+    started_at = started.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    async with session.get(
-        "https://api.twitch.tv/helix/clips",
-        params=params,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Client-Id": TWITCH_CLIENT_ID,
-        },
-    ) as response:
-        data = await response.json(content_type=None)
-        if response.status == 401:
-            # Renueva el token una vez si expiró entre consultas.
-            token = await get_twitch_app_token(force_refresh=True)
-            async with session.get(
-                "https://api.twitch.tv/helix/clips",
-                params=params,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Client-Id": TWITCH_CLIENT_ID,
-                },
-            ) as retry:
-                data = await retry.json(content_type=None)
-                if retry.status != 200:
-                    raise RuntimeError(f"Twitch Get Clips devolvió HTTP {retry.status}: {data}")
-        elif response.status != 200:
-            raise RuntimeError(f"Twitch Get Clips devolvió HTTP {response.status}: {data}")
+    async def get_page(after: Optional[str] = None, refresh: bool = False) -> dict:
+        token = await get_twitch_app_token(force_refresh=refresh)
+        params = {
+            "broadcaster_id": broadcaster_id,
+            "started_at": started_at,
+            "first": "100",
+        }
+        if after:
+            params["after"] = after
+        async with session.get(
+            "https://api.twitch.tv/helix/clips",
+            params=params,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Client-Id": TWITCH_CLIENT_ID,
+            },
+        ) as response:
+            data = await response.json(content_type=None)
+            if response.status == 401 and not refresh:
+                return await get_page(after=after, refresh=True)
+            if response.status != 200:
+                raise RuntimeError(f"Twitch Get Clips devolvió HTTP {response.status}: {data}")
+            return data
 
-    clips = data.get("data") or []
-    return sorted(clips, key=lambda clip: clip.get("created_at") or "")
+    clips: list[dict] = []
+    cursor: Optional[str] = None
+    for _ in range(3):
+        data = await get_page(after=cursor)
+        clips.extend(data.get("data") or [])
+        cursor = (data.get("pagination") or {}).get("cursor")
+        if not cursor:
+            break
 
+    # Dedupe por ID y orden cronológico para publicarlos de viejo -> nuevo.
+    unique: dict[str, dict] = {}
+    for clip in clips:
+        clip_id = str(clip.get("id") or "")
+        if clip_id:
+            unique[clip_id] = clip
+    return sorted(unique.values(), key=lambda clip: clip.get("created_at") or "")
 
 def twitch_clip_embed(clip: dict) -> discord.Embed:
     title = clip.get("title") or "Nuevo clip"
@@ -747,7 +769,7 @@ def twitch_clip_view(clip: dict) -> discord.ui.View:
 async def clip_already_posted(channel: discord.TextChannel, clip_id: str) -> bool:
     wanted = f"Twitch clip ID: {clip_id}"
     try:
-        async for msg in channel.history(limit=100):
+        async for msg in channel.history(limit=500):
             if msg.author != channel.guild.me:
                 continue
             for embed in msg.embeds:
@@ -759,11 +781,26 @@ async def clip_already_posted(channel: discord.TextChannel, clip_id: str) -> boo
 
 
 async def publish_new_twitch_clips(guild: discord.Guild) -> int:
+    global _twitch_clips_last_check_at, _twitch_clips_last_error
+    global _twitch_clips_last_found, _twitch_clips_last_published
+    global _twitch_clips_last_newest_title, _twitch_clips_last_newest_created
+
+    _twitch_clips_last_check_at = discord.utils.utcnow()
     channel = find_text(guild, CH_CLIPS)
     if channel is None:
-        return 0
+        _twitch_clips_last_error = f"No existe el canal {CH_CLIPS}"
+        raise RuntimeError(_twitch_clips_last_error)
 
-    clips = await fetch_recent_twitch_clips()
+    try:
+        clips = await fetch_recent_twitch_clips()
+    except Exception as exc:
+        _twitch_clips_last_error = f"{type(exc).__name__}: {exc}"
+        raise
+
+    _twitch_clips_last_found = len(clips)
+    newest_clip = clips[-1] if clips else None
+    _twitch_clips_last_newest_title = (newest_clip.get("title") or "Sin título") if newest_clip else None
+    _twitch_clips_last_newest_created = newest_clip.get("created_at") if newest_clip else None
     published = 0
     for clip in clips:
         clip_id = str(clip.get("id") or "")
@@ -776,8 +813,19 @@ async def publish_new_twitch_clips(guild: discord.Guild) -> int:
                 allowed_mentions=discord.AllowedMentions.none(),
             )
             published += 1
-        except discord.Forbidden:
-            break
+        except discord.Forbidden as exc:
+            _twitch_clips_last_error = "No puedo enviar mensajes en el canal de clips"
+            raise RuntimeError(_twitch_clips_last_error) from exc
+
+    _twitch_clips_last_error = None
+    _twitch_clips_last_published = published
+    if clips or published:
+        newest = clips[-1] if clips else None
+        newest_text = (
+            f" • último: {newest.get('title', 'sin título')[:80]}"
+            if newest else ""
+        )
+        print(f"🎬 Clips: encontrados {len(clips)}, publicados {published}{newest_text}")
     return published
 
 
@@ -843,7 +891,6 @@ ROLE_VIP = "⭐・VIP"
 ROLE_LIVE = "🔴・EN DIRECTO"
 ROLE_LIVE_NOTIFY = "🔔・Avisos de directo"
 ROLE_EVENT_NOTIFY = "🎉・Avisos de eventos"
-ROLE_GIVEAWAY_NOTIFY = "🎁・Avisos de sorteos"
 ROLE_GAME_VALORANT = "🔫・Valorant"
 ROLE_GAME_MINECRAFT = "⛏️・Minecraft"
 ROLE_GAME_OTHER = "🎮・Otros juegos"
@@ -919,7 +966,7 @@ ROLE_PANEL_NOTIFY_TITLE = "📣 Elegí tus avisos"
 LEGACY_ROLE_PANEL_NOTIFY_TITLE = "🔔 Avisos de directo"
 GAME_REACTION_ROLES = {"🔫": ROLE_GAME_VALORANT, "⛏️": ROLE_GAME_MINECRAFT, "🎮": ROLE_GAME_OTHER}
 PLATFORM_REACTION_ROLES = {"🖥️": ROLE_PLATFORM_PC, "🎮": ROLE_PLATFORM_CONSOLE, "📱": ROLE_PLATFORM_MOBILE}
-NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY, "🎉": ROLE_EVENT_NOTIFY, "🎁": ROLE_GIVEAWAY_NOTIFY}
+NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY, "🎉": ROLE_EVENT_NOTIFY}
 STREAM_NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY}
 GUIDE_PREFIX = "📌 Guía — "
 
@@ -945,6 +992,8 @@ CH_COMMANDS = "🤖・comandos"
 CH_CLIPS = "🎬・clips"
 CH_PETS = "🐾・mascotas"
 CH_SUGGESTIONS = "💡・sugerencias"
+CH_STARBOARD = "⭐・destacados"
+CH_EVENTS = "🎉・eventos"
 CH_INVITE = "🔗・invitar-amigos"
 
 CH_GAMING = "🎮・gaming"
@@ -1027,13 +1076,20 @@ async def ensure_role(
         if bot_member is not None and role >= bot_member.top_role:
             return role
 
-        await role.edit(
-            permissions=permissions,
-            colour=discord.Colour(colour),
-            hoist=hoist,
-            mentionable=False,
-            reason="Actualización de permisos del setup",
-        )
+        wanted_colour = discord.Colour(colour)
+        if (
+            role.permissions != permissions
+            or role.colour != wanted_colour
+            or role.hoist != hoist
+            or role.mentionable
+        ):
+            await role.edit(
+                permissions=permissions,
+                colour=wanted_colour,
+                hoist=hoist,
+                mentionable=False,
+                reason="Actualización de permisos del setup",
+            )
     return role
 
 
@@ -1044,12 +1100,13 @@ async def ensure_category(
 ) -> discord.CategoryChannel:
     category = find_category(guild, name)
     if category is None:
-        category = await guild.create_category(
+        return await guild.create_category(
             name,
             overwrites=overwrites,
             reason="Setup automático del servidor",
         )
-    else:
+
+    if category.overwrites != overwrites:
         await category.edit(
             overwrites=overwrites,
             reason="Actualización de permisos del setup",
@@ -1065,21 +1122,25 @@ async def ensure_text_channel(
     topic: Optional[str] = None,
 ) -> discord.TextChannel:
     channel = find_text(guild, name)
+    wanted_overwrites = overwrites if overwrites is not None else category.overwrites
     if channel is None:
-        channel = await guild.create_text_channel(
+        return await guild.create_text_channel(
             name,
             category=category,
-            overwrites=overwrites,
+            overwrites=wanted_overwrites,
             topic=topic,
             reason="Setup automático del servidor",
         )
-    else:
-        await channel.edit(
-            category=category,
-            overwrites=overwrites if overwrites is not None else category.overwrites,
-            topic=topic,
-            reason="Actualización del setup",
-        )
+
+    edits = {}
+    if channel.category_id != category.id:
+        edits["category"] = category
+    if channel.overwrites != wanted_overwrites:
+        edits["overwrites"] = wanted_overwrites
+    if channel.topic != topic:
+        edits["topic"] = topic
+    if edits:
+        await channel.edit(**edits, reason="Actualización del setup")
     return channel
 
 
@@ -1090,37 +1151,30 @@ async def ensure_voice_channel(
     overwrites: Optional[dict] = None,
 ) -> discord.VoiceChannel:
     channel = find_voice(guild, name)
+    wanted_overwrites = overwrites if overwrites is not None else category.overwrites
     if channel is None:
-        channel = await guild.create_voice_channel(
+        return await guild.create_voice_channel(
             name,
             category=category,
-            overwrites=overwrites,
+            overwrites=wanted_overwrites,
             reason="Setup automático del servidor",
         )
-    else:
-        await channel.edit(
-            category=category,
-            overwrites=overwrites if overwrites is not None else category.overwrites,
-            reason="Actualización del setup",
-        )
+
+    edits = {}
+    if channel.category_id != category.id:
+        edits["category"] = category
+    if channel.overwrites != wanted_overwrites:
+        edits["overwrites"] = wanted_overwrites
+    if edits:
+        await channel.edit(**edits, reason="Actualización del setup")
     return channel
 
 
 
 def current_member_count(guild: discord.Guild) -> int:
-    """Devuelve una cantidad de miembros estable para el contador visual.
-
-    Discord puede tardar un instante en refrescar ``guild.member_count`` después
-    de un join/leave. Cuando la caché de miembros está disponible preferimos
-    ``len(guild.members)`` si la diferencia es pequeña; así el contador cambia
-    inmediatamente al entrar o salir alguien.
-    """
-    cached = len(guild.members)
-    reported = guild.member_count or 0
-
-    if cached > 0 and (reported == 0 or abs(cached - reported) <= 2):
-        return cached
-    return reported or cached
+    if guild.member_count is not None:
+        return int(guild.member_count)
+    return len(guild.members)
 
 
 def member_counter_name(guild: discord.Guild) -> str:
@@ -1128,7 +1182,6 @@ def member_counter_name(guild: discord.Guild) -> str:
 
 
 def find_member_counter_voice(guild: discord.Guild) -> Optional[discord.VoiceChannel]:
-    # Acepta el formato nuevo y migra contadores viejos como "👥・7 miembros".
     for channel in guild.voice_channels:
         lower = channel.name.lower()
         if "miembro" in lower and any(char.isdigit() for char in channel.name):
@@ -1148,7 +1201,7 @@ def indicator_overwrites(guild: discord.Guild) -> dict:
 
 
 async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:
-    """Crea/migra los dos indicadores bloqueados y los deja sin categoría arriba."""
+    """Crea/migra los indicadores. Si ya están bien, no los vuelve a mover."""
     overwrites = indicator_overwrites(guild)
     wanted_count = member_counter_name(guild)
 
@@ -1162,21 +1215,22 @@ async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChan
             reason="Contador visual de miembros",
         )
     else:
-        needs_edit = counter.name != wanted_count or counter.category is not None
-        if needs_edit:
-            await counter.edit(
-                name=wanted_count,
-                category=None,
-                position=0,
-                overwrites=overwrites,
-                reason="Actualizar contador visual de miembros",
-            )
-        else:
-            await counter.edit(position=0, overwrites=overwrites, reason="Acomodar contador visual")
+        edits = {}
+        if counter.name != wanted_count:
+            edits["name"] = wanted_count
+        if counter.category is not None:
+            edits["category"] = None
+        if counter.overwrites != overwrites:
+            edits["overwrites"] = overwrites
+        if edits:
+            await counter.edit(**edits, reason="Actualizar contador visual de miembros")
 
     invite_indicator = find_voice(guild, VC_INVITE_INDICATOR)
     if invite_indicator is None:
-        invite_indicator = next((vc for vc in guild.voice_channels if "invitar amigos" in vc.name.lower()), None)
+        invite_indicator = next(
+            (vc for vc in guild.voice_channels if "invitar amigos" in vc.name.lower()),
+            None,
+        )
     if invite_indicator is None:
         invite_indicator = await guild.create_voice_channel(
             VC_INVITE_INDICATOR,
@@ -1186,40 +1240,69 @@ async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChan
             reason="Indicador visual de invitación",
         )
     else:
-        await invite_indicator.edit(
-            category=None,
-            position=1,
-            overwrites=overwrites,
-            reason="Acomodar indicador de invitación",
-        )
+        edits = {}
+        if invite_indicator.name != VC_INVITE_INDICATOR:
+            edits["name"] = VC_INVITE_INDICATOR
+        if invite_indicator.category is not None:
+            edits["category"] = None
+        if invite_indicator.overwrites != overwrites:
+            edits["overwrites"] = overwrites
+        if edits:
+            await invite_indicator.edit(**edits, reason="Actualizar indicador de invitación")
 
-    # Discord separa el orden de canales de voz/texto; volver a moverlos deja
-    # ambos indicadores consecutivos en el bloque de voz sin categoría.
-    try:
-        await counter.edit(position=0, reason="Indicadores arriba del servidor")
-        await invite_indicator.edit(position=1, reason="Indicadores arriba del servidor")
-    except discord.HTTPException:
-        pass
     return counter, invite_indicator
 
 
-async def update_member_counter(guild: discord.Guild) -> None:
+async def update_member_counter(guild: discord.Guild, count_override: Optional[int] = None) -> None:
     channel = find_member_counter_voice(guild)
     if channel is None:
         return
-    wanted = member_counter_name(guild)
-    if channel.name != wanted:
+    count = current_member_count(guild) if count_override is None else max(0, int(count_override))
+    wanted = f"💜 {count} Miembros 💜"
+    if channel.name == wanted:
+        return
+    try:
+        previous = channel.name
+        await channel.edit(name=wanted, reason="Actualizar cantidad de miembros")
+        print(f"👥 Contador actualizado: {previous} -> {wanted}")
+    except discord.Forbidden:
+        print("⚠️ No pude actualizar el contador: falta Administrar canales.")
+    except discord.HTTPException as exc:
+        print(f"⚠️ Discord demoró/rechazó el contador: {exc}")
+
+
+_member_counter_pending_delta: dict[int, int] = {}
+_member_counter_debounce_tasks: dict[int, asyncio.Task] = {}
+
+
+async def schedule_member_counter_update(guild: discord.Guild, delta: int) -> None:
+    """Agrupa entradas/salidas cercanas y hace un solo rename del canal."""
+    guild_id = guild.id
+    _member_counter_pending_delta[guild_id] = _member_counter_pending_delta.get(guild_id, 0) + delta
+    running = _member_counter_debounce_tasks.get(guild_id)
+    if running is not None and not running.done():
+        return
+
+    async def worker():
         try:
-            await channel.edit(name=wanted, reason="Actualizar cantidad de miembros")
-        except discord.Forbidden:
-            print("⚠️ No pude actualizar el contador de miembros: falta Administrar canales.")
-        except discord.HTTPException as exc:
-            print(f"⚠️ Discord rechazó la actualización del contador: {exc}")
+            await asyncio.sleep(8)
+            pending = _member_counter_pending_delta.pop(guild_id, 0)
+            visible_channel = find_member_counter_voice(guild)
+            if visible_channel is None:
+                return
+            match = re.search(r"(\d+)", visible_channel.name.replace(".", "").replace(",", ""))
+            visible = int(match.group(1)) if match else current_member_count(guild)
+            target = max(0, visible + pending)
+            await update_member_counter(guild, target)
+        finally:
+            _member_counter_debounce_tasks.pop(guild_id, None)
+
+    _member_counter_debounce_tasks[guild_id] = asyncio.create_task(worker())
 
 
-@tasks.loop(seconds=60)
+@tasks.loop(minutes=10)
 async def member_counter_watch():
-    """Resincronización de respaldo por si Discord pierde un evento de entrada/salida."""
+    """Respaldo poco frecuente para corregir diferencias sin castigar la API."""
     for guild in bot.guilds:
         try:
             await update_member_counter(guild)
@@ -1420,6 +1503,7 @@ async def cleanup_duplicate_system_messages(guild: discord.Guild) -> None:
         (find_text(guild, CH_INVITE), ["💜 Invitá a tus amigos"]),
         (find_text(guild, CH_VERIFY), ["✅ Verificación"]),
         (find_text(guild, CH_COMMANDS), ["🎫 Soporte y reportes"]),
+        (find_text(guild, CH_SUGGESTIONS), [SUGGESTION_PANEL_TITLE]),
     ]
 
     for channel, titles in targets:
@@ -1427,6 +1511,22 @@ async def cleanup_duplicate_system_messages(guild: discord.Guild) -> None:
             continue
         for title in titles:
             await find_bot_embed_message(channel, title, limit=500, delete_duplicates=True)
+
+
+async def cleanup_legacy_giveaway_role(guild: discord.Guild) -> None:
+    """Elimina el antiguo rol de avisos que ya no se usa."""
+    role = find_role(guild, "🎁・Avisos de sorteos")
+    if role is None:
+        return
+    me = guild.me
+    if me is None or role >= me.top_role:
+        print("⚠️ No pude eliminar un rol legado de avisos por jerarquía.")
+        return
+    try:
+        await role.delete(reason="Rol de avisos antiguo retirado del servidor")
+        print("🧹 Rol legado de avisos eliminado.")
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
@@ -2073,6 +2173,595 @@ class CloseTicketView(discord.ui.View):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# SUGERENCIAS, DESTACADOS Y EVENTOS
+# ──────────────────────────────────────────────────────────────────────────────
+
+SUGGESTION_PANEL_TITLE = "💡 Buzón de sugerencias"
+SUGGESTION_FOOTER_PREFIX = "suggestion|"
+STARBOARD_FOOTER_PREFIX = "starboard_source:"
+EVENT_FOOTER_PREFIX = "event|"
+
+
+def set_embed_field(embed: discord.Embed, name: str, value: str, inline: bool = False) -> None:
+    for index, field in enumerate(embed.fields):
+        if field.name == name:
+            embed.set_field_at(index, name=name, value=value, inline=inline)
+            return
+    embed.add_field(name=name, value=value, inline=inline)
+
+
+def suggestion_is_message(message: discord.Message) -> bool:
+    if not message.embeds or not message.embeds[0].footer:
+        return False
+    return bool((message.embeds[0].footer.text or "").startswith(SUGGESTION_FOOTER_PREFIX))
+
+
+async def count_non_bot_reaction_users(message: discord.Message, emoji: str) -> int:
+    for reaction in message.reactions:
+        if str(reaction.emoji) != emoji:
+            continue
+        total = 0
+        try:
+            async for user in reaction.users(limit=None):
+                if not user.bot:
+                    total += 1
+        except (discord.Forbidden, discord.HTTPException):
+            return max(0, reaction.count - 1)
+        return total
+    return 0
+
+
+async def update_suggestion_votes(message: discord.Message) -> None:
+    if not suggestion_is_message(message) or not message.embeds:
+        return
+    up = await count_non_bot_reaction_users(message, "👍")
+    down = await count_non_bot_reaction_users(message, "👎")
+    embed = discord.Embed.from_dict(message.embeds[0].to_dict())
+    set_embed_field(embed, "🗳️ Votación", f"👍 **{up}** a favor   •   👎 **{down}** en contra")
+    try:
+        await message.edit(embed=embed, view=SuggestionStaffView())
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+
+
+class SuggestionModal(discord.ui.Modal, title="Enviar sugerencia"):
+    suggestion_title = discord.ui.TextInput(
+        label="Título",
+        placeholder="Ej: Noche de Minecraft",
+        max_length=100,
+    )
+    suggestion_description = discord.ui.TextInput(
+        label="Descripción",
+        placeholder="Contanos tu idea de forma clara...",
+        style=discord.TextStyle.paragraph,
+        max_length=1500,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Solo funciona dentro del servidor.", ephemeral=True)
+        channel = find_text(interaction.guild, CH_SUGGESTIONS)
+        if channel is None:
+            return await interaction.response.send_message("No encuentro el canal de sugerencias.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = discord.Embed(
+            title=f"💡 {safe_text(self.suggestion_title.value, 100)}",
+            description=safe_text(self.suggestion_description.value, 1500),
+            colour=discord.Colour.gold(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="👤 Propuesta por", value=interaction.user.mention, inline=True)
+        embed.add_field(name="📌 Estado", value="🟡 Pendiente", inline=True)
+        embed.add_field(name="🗳️ Votación", value="👍 **0** a favor   •   👎 **0** en contra", inline=False)
+        embed.set_footer(text=f"{SUGGESTION_FOOTER_PREFIX}author={interaction.user.id}|status=pending")
+        message = await channel.send(
+            embed=embed,
+            view=SuggestionStaffView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        for emoji in ("👍", "👎"):
+            try:
+                await message.add_reaction(emoji)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        await interaction.followup.send(
+            f"✅ Tu sugerencia fue publicada: {message.jump_url}",
+            ephemeral=True,
+        )
+
+
+class SuggestionPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Enviar sugerencia",
+        emoji="💡",
+        style=discord.ButtonStyle.primary,
+        custom_id="streamer_server:suggestion_open",
+    )
+    async def open_modal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(SuggestionModal())
+
+
+class SuggestionStaffView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def change_status(self, interaction: discord.Interaction, status: str, label: str, colour: discord.Colour):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+            return await interaction.response.send_message("Solo el staff puede cambiar el estado.", ephemeral=True)
+        if interaction.message is None or not interaction.message.embeds:
+            return await interaction.response.send_message("No pude leer esta sugerencia.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        embed = discord.Embed.from_dict(interaction.message.embeds[0].to_dict())
+        set_embed_field(embed, "📌 Estado", label, inline=True)
+        footer = embed.footer.text or ""
+        if footer.startswith(SUGGESTION_FOOTER_PREFIX):
+            footer = re.sub(r"status=[^|]+", f"status={status}", footer)
+        embed.set_footer(text=footer)
+        embed.colour = colour
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.followup.send(f"✅ Estado cambiado a **{label}**.", ephemeral=True)
+
+    @discord.ui.button(label="En revisión", emoji="🟡", style=discord.ButtonStyle.secondary, custom_id="streamer_server:suggestion_review")
+    async def review(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_status(interaction, "review", "🟡 En revisión", discord.Colour.orange())
+
+    @discord.ui.button(label="Aceptar", emoji="✅", style=discord.ButtonStyle.success, custom_id="streamer_server:suggestion_accept")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_status(interaction, "accepted", "✅ Aceptada", discord.Colour.green())
+
+    @discord.ui.button(label="Rechazar", emoji="❌", style=discord.ButtonStyle.danger, custom_id="streamer_server:suggestion_reject")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.change_status(interaction, "rejected", "❌ Rechazada", discord.Colour.red())
+
+
+async def ensure_suggestion_panel(guild: discord.Guild) -> Optional[discord.Message]:
+    channel = find_text(guild, CH_SUGGESTIONS)
+    if channel is None:
+        return None
+    embed = discord.Embed(
+        title=SUGGESTION_PANEL_TITLE,
+        description=(
+            "¿Tenés una idea para mejorar el Discord, los streams o los eventos?\n\n"
+            "Tocá **Enviar sugerencia**. La comunidad podrá votar con 👍 o 👎 y el staff marcará su estado."
+        ),
+        colour=discord.Colour.blurple(),
+    )
+    message = await find_bot_embed_message(channel, SUGGESTION_PANEL_TITLE, limit=500, delete_duplicates=True)
+    if message is None:
+        return await channel.send(embed=embed, view=SuggestionPanelView())
+    try:
+        await message.edit(embed=embed, view=SuggestionPanelView())
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+        pass
+    return message
+
+
+async def handle_suggestion_reaction(payload: discord.RawReactionActionEvent, added: bool) -> None:
+    if payload.guild_id is None or str(payload.emoji) not in {"👍", "👎"}:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    if not isinstance(channel, discord.TextChannel) or channel.name != CH_SUGGESTIONS:
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+    if not suggestion_is_message(message):
+        return
+
+    if added:
+        member = await reaction_member(guild, payload.user_id)
+        if member is not None and not member.bot:
+            opposite = "👎" if str(payload.emoji) == "👍" else "👍"
+            for reaction in message.reactions:
+                if str(reaction.emoji) == opposite:
+                    try:
+                        await reaction.remove(member)
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                    break
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+    await update_suggestion_votes(message)
+
+
+async def starboard_reactors(message: discord.Message) -> int:
+    for reaction in message.reactions:
+        if str(reaction.emoji) != "⭐":
+            continue
+        unique: set[int] = set()
+        try:
+            async for user in reaction.users(limit=None):
+                if user.bot or user.id == message.author.id:
+                    continue
+                unique.add(user.id)
+        except (discord.Forbidden, discord.HTTPException):
+            return max(0, reaction.count - 1)
+        return len(unique)
+    return 0
+
+
+async def find_starboard_post(channel: discord.TextChannel, source_id: int) -> Optional[discord.Message]:
+    marker = f"{STARBOARD_FOOTER_PREFIX}{source_id}"
+    try:
+        async for msg in channel.history(limit=500):
+            if msg.author != channel.guild.me or not msg.embeds:
+                continue
+            footer = msg.embeds[0].footer.text if msg.embeds[0].footer else None
+            if footer == marker:
+                return msg
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+    return None
+
+
+def starboard_embed(message: discord.Message, stars: int) -> discord.Embed:
+    content = message.content.strip() if message.content else ""
+    description = safe_text(content, 1500) if content else "*Abrí el mensaje original para ver el contenido completo.*"
+    embed = discord.Embed(
+        title="⭐ Mensaje destacado",
+        description=description,
+        colour=discord.Colour.gold(),
+        timestamp=message.created_at,
+    )
+    embed.add_field(name="👤 Autor", value=message.author.mention, inline=True)
+    embed.add_field(name="💬 Canal", value=message.channel.mention, inline=True)
+    tier = "⭐ Destacado"
+    if stars >= 20:
+        tier = "🏆 Legendario"
+    elif stars >= 10:
+        tier = "🔥 Muy destacado"
+    embed.add_field(name="⭐ Reacciones", value=f"**{stars}** • {tier}", inline=False)
+
+    image_url = None
+    for attachment in message.attachments:
+        content_type = (attachment.content_type or "").lower()
+        if content_type.startswith("image/"):
+            image_url = attachment.url
+            break
+    if image_url is None and message.embeds:
+        original = message.embeds[0]
+        if original.image and original.image.url:
+            image_url = original.image.url
+        elif original.thumbnail and original.thumbnail.url:
+            image_url = original.thumbnail.url
+    if image_url:
+        embed.set_image(url=image_url)
+    embed.set_footer(text=f"{STARBOARD_FOOTER_PREFIX}{message.id}")
+    return embed
+
+
+def jump_link_view(url: str, label: str = "Ir al mensaje") -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label=label, emoji="🔗", style=discord.ButtonStyle.link, url=url))
+    return view
+
+
+async def handle_starboard_reaction(payload: discord.RawReactionActionEvent) -> None:
+    if payload.guild_id is None or str(payload.emoji) != "⭐":
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if guild is None:
+        return
+    channel = guild.get_channel(payload.channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+    excluded = {
+        CH_STARBOARD, CH_VERIFY, CH_ROLES, CH_RULES, CH_ANNOUNCEMENTS,
+        CH_STREAMS, CH_CLIPS, CH_COMMANDS, CH_SUGGESTIONS, CH_INVITE,
+        CH_EVENTS, CH_LOGS, CH_REPORTS, CH_STAFF,
+    }
+    if channel.name in excluded or (channel.category and channel.category.name == CAT_TICKETS):
+        return
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+    if message.author.bot:
+        return
+
+    # La propia persona no cuenta para destacar su mensaje.
+    if payload.user_id == message.author.id:
+        reaction = discord.utils.get(message.reactions, emoji="⭐")
+        member = await reaction_member(guild, payload.user_id)
+        if reaction is not None and member is not None:
+            try:
+                await reaction.remove(member)
+                message = await channel.fetch_message(payload.message_id)
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+
+    stars = await starboard_reactors(message)
+    star_channel = find_text(guild, CH_STARBOARD)
+    if star_channel is None:
+        return
+    existing = await find_starboard_post(star_channel, message.id)
+    if stars < STARBOARD_THRESHOLD:
+        if existing is not None:
+            try:
+                await existing.delete()
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                pass
+        return
+
+    embed = starboard_embed(message, stars)
+    view = jump_link_view(message.jump_url)
+    if existing is None:
+        try:
+            await star_channel.send(embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+        except discord.Forbidden:
+            pass
+    else:
+        try:
+            await existing.edit(embed=embed, view=view)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            pass
+
+
+def parse_event_datetime(value: str) -> datetime:
+    value = value.strip()
+    now_local = datetime.now(EVENT_TZ)
+    formats = ("%d/%m/%Y %H:%M", "%d/%m %H:%M")
+    last_error = None
+    for fmt in formats:
+        try:
+            parsed = datetime.strptime(value, fmt)
+            if fmt == "%d/%m %H:%M":
+                parsed = parsed.replace(year=now_local.year)
+                local = parsed.replace(tzinfo=EVENT_TZ)
+                if local <= now_local:
+                    local = local.replace(year=now_local.year + 1)
+                return local
+            return parsed.replace(tzinfo=EVENT_TZ)
+        except ValueError as exc:
+            last_error = exc
+    raise ValueError("Usá `DD/MM HH:MM` o `DD/MM/AAAA HH:MM`.") from last_error
+
+
+def parse_event_footer(embed: discord.Embed) -> Optional[dict]:
+    footer = embed.footer.text if embed.footer else ""
+    if not footer.startswith(EVENT_FOOTER_PREFIX):
+        return None
+    state = {"users": []}
+    for piece in footer[len(EVENT_FOOTER_PREFIX):].split("|"):
+        if "=" not in piece:
+            continue
+        key, value = piece.split("=", 1)
+        state[key] = value
+    try:
+        state["ts"] = int(state.get("ts", 0))
+        state["max"] = int(state.get("max", 10))
+        state["owner"] = int(state.get("owner", 0))
+        state["rem30"] = int(state.get("rem30", 0))
+        state["started"] = int(state.get("started", 0))
+        raw_users = state.get("users", "")
+        state["users"] = [int(x) for x in raw_users.split(",") if x.isdigit()]
+    except (TypeError, ValueError):
+        return None
+    return state
+
+
+def serialize_event_footer(state: dict) -> str:
+    users = ",".join(str(x) for x in state.get("users", []))
+    return (
+        f"{EVENT_FOOTER_PREFIX}ts={state['ts']}|max={state['max']}|owner={state['owner']}|"
+        f"status={state.get('status', 'open')}|rem30={state.get('rem30', 0)}|"
+        f"started={state.get('started', 0)}|users={users}"
+    )
+
+
+def event_status_label(state: dict) -> str:
+    status = state.get("status", "open")
+    if status == "closed":
+        return "🔒 Cerrado"
+    if status == "started":
+        return "🎉 En curso"
+    if len(state.get("users", [])) >= state.get("max", 10):
+        return "🔒 Cupos completos"
+    return "🟢 Inscripciones abiertas"
+
+
+def update_event_embed(embed: discord.Embed, state: dict) -> discord.Embed:
+    users = state.get("users", [])
+    participant_text = "\n".join(f"<@{uid}>" for uid in users) if users else "*Todavía no se anotó nadie.*"
+    participant_text += f"\n\n**{len(users)}/{state.get('max', 10)} participantes**"
+    set_embed_field(embed, "👥 Participantes", participant_text, inline=False)
+    set_embed_field(embed, "📌 Estado", event_status_label(state), inline=True)
+    embed.set_footer(text=serialize_event_footer(state))
+    return embed
+
+
+class EventView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Participar", emoji="✅", style=discord.ButtonStyle.success, custom_id="streamer_server:event_join")
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.message is None or not interaction.message.embeds or not isinstance(interaction.user, discord.Member):
+            return
+        state = parse_event_footer(interaction.message.embeds[0])
+        if state is None:
+            return await interaction.response.send_message("No pude leer este evento.", ephemeral=True)
+        if state.get("status") != "open" or int(datetime.now(EVENT_TZ).timestamp()) >= state["ts"]:
+            return await interaction.response.send_message("Este evento ya no acepta participantes.", ephemeral=True)
+        users = state["users"]
+        if interaction.user.id in users:
+            return await interaction.response.send_message("Ya estás anotado/a.", ephemeral=True)
+        if len(users) >= state["max"]:
+            return await interaction.response.send_message("Los cupos están completos.", ephemeral=True)
+        users.append(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        embed = update_event_embed(discord.Embed.from_dict(interaction.message.embeds[0].to_dict()), state)
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.followup.send("✅ Te anotaste al evento.", ephemeral=True)
+
+    @discord.ui.button(label="Salirme", emoji="🚪", style=discord.ButtonStyle.secondary, custom_id="streamer_server:event_leave")
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.message is None or not interaction.message.embeds or not isinstance(interaction.user, discord.Member):
+            return
+        state = parse_event_footer(interaction.message.embeds[0])
+        if state is None:
+            return await interaction.response.send_message("No pude leer este evento.", ephemeral=True)
+        if interaction.user.id not in state["users"]:
+            return await interaction.response.send_message("No estabas anotado/a.", ephemeral=True)
+        state["users"].remove(interaction.user.id)
+        await interaction.response.defer(ephemeral=True)
+        embed = update_event_embed(discord.Embed.from_dict(interaction.message.embeds[0].to_dict()), state)
+        await interaction.message.edit(embed=embed, view=self)
+        await interaction.followup.send("🚪 Saliste del evento.", ephemeral=True)
+
+    @discord.ui.button(label="Cerrar", emoji="🔒", style=discord.ButtonStyle.danger, custom_id="streamer_server:event_close")
+    async def close_event(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None or interaction.message is None or not interaction.message.embeds or not isinstance(interaction.user, discord.Member):
+            return
+        state = parse_event_footer(interaction.message.embeds[0])
+        if state is None:
+            return await interaction.response.send_message("No pude leer este evento.", ephemeral=True)
+        if not is_staff(interaction.user) and interaction.user.id != state.get("owner"):
+            return await interaction.response.send_message("Solo el organizador o el staff puede cerrarlo.", ephemeral=True)
+        state["status"] = "closed"
+        await interaction.response.defer(ephemeral=True)
+        embed = update_event_embed(discord.Embed.from_dict(interaction.message.embeds[0].to_dict()), state)
+        await interaction.message.edit(embed=embed, view=None)
+        await interaction.followup.send("🔒 Evento cerrado.", ephemeral=True)
+
+
+class EventModal(discord.ui.Modal, title="Crear evento"):
+    event_name = discord.ui.TextInput(label="Nombre", placeholder="Ej: Custom de Valorant", max_length=100)
+    event_date = discord.ui.TextInput(label="Fecha y hora", placeholder="Ej: 15/08 22:00", max_length=30)
+    event_slots = discord.ui.TextInput(label="Cupos", placeholder="Ej: 10", max_length=3)
+    event_description = discord.ui.TextInput(
+        label="Descripción",
+        placeholder="Qué van a hacer, requisitos, modo de juego...",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+            return await interaction.response.send_message("Solo el staff puede crear eventos.", ephemeral=True)
+        try:
+            event_dt = parse_event_datetime(self.event_date.value)
+            slots = int(self.event_slots.value.strip())
+            if not 2 <= slots <= 50:
+                raise ValueError("Los cupos deben estar entre 2 y 50.")
+        except ValueError as exc:
+            return await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+
+        channel = find_text(interaction.guild, CH_EVENTS)
+        if channel is None:
+            return await interaction.response.send_message("No encuentro el canal de eventos.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        ts = int(event_dt.timestamp())
+        state = {
+            "ts": ts,
+            "max": slots,
+            "owner": interaction.user.id,
+            "status": "open",
+            "rem30": 0,
+            "started": 0,
+            "users": [],
+        }
+        embed = discord.Embed(
+            title=f"🎉 {safe_text(self.event_name.value, 100)}",
+            description=safe_text(self.event_description.value, 1000) if self.event_description.value.strip() else "Evento de la comunidad.",
+            colour=discord.Colour.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.add_field(name="📅 Fecha", value=f"<t:{ts}:F>\n<t:{ts}:R>", inline=True)
+        embed.add_field(name="👤 Organiza", value=interaction.user.mention, inline=True)
+        embed = update_event_embed(embed, state)
+
+        event_role = find_role(interaction.guild, ROLE_EVENT_NOTIFY)
+        mention = event_role.mention if event_role else None
+        changed = False
+        if event_role is not None and not event_role.mentionable and interaction.guild.me and event_role < interaction.guild.me.top_role:
+            try:
+                await event_role.edit(mentionable=True, reason="Aviso de nuevo evento")
+                changed = True
+            except discord.Forbidden:
+                pass
+        try:
+            message = await channel.send(
+                content=mention,
+                embed=embed,
+                view=EventView(),
+                allowed_mentions=discord.AllowedMentions(roles=[event_role] if event_role else False, users=False, everyone=False),
+            )
+        finally:
+            if changed:
+                try:
+                    await event_role.edit(mentionable=False, reason="Fin del aviso de evento")
+                except discord.Forbidden:
+                    pass
+        await interaction.followup.send(f"✅ Evento publicado: {message.jump_url}", ephemeral=True)
+
+
+@tasks.loop(seconds=60)
+async def event_watch():
+    if not GUILD_ID:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    channel = find_text(guild, CH_EVENTS)
+    if channel is None:
+        return
+    now_ts = int(datetime.now(EVENT_TZ).timestamp())
+    try:
+        async for message in channel.history(limit=100):
+            if message.author != guild.me or not message.embeds:
+                continue
+            state = parse_event_footer(message.embeds[0])
+            if state is None or state.get("status") in {"closed", "started"}:
+                continue
+            remaining = state["ts"] - now_ts
+            changed = False
+            users = state.get("users", [])
+            mention_text = " ".join(f"<@{uid}>" for uid in users)
+
+            if 0 < remaining <= 1800 and not state.get("rem30"):
+                state["rem30"] = 1
+                changed = True
+                await channel.send(
+                    content=(mention_text + "\n" if mention_text else "") + f"🔔 **El evento empieza en menos de 30 minutos.** {message.jump_url}",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+
+            if remaining <= 0 and not state.get("started"):
+                state["started"] = 1
+                state["status"] = "started"
+                changed = True
+                await channel.send(
+                    content=(mention_text + "\n" if mention_text else "") + f"🎉 **¡El evento empieza ahora!** {message.jump_url}",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+
+            if changed:
+                embed = update_event_embed(discord.Embed.from_dict(message.embeds[0].to_dict()), state)
+                await message.edit(embed=embed, view=None if state.get("status") == "started" else EventView())
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"⚠️ Event watcher: {type(exc).__name__}: {exc}")
+
+
+@event_watch.before_loop
+async def before_event_watch():
+    await bot.wait_until_ready()
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # HEALTH CHECK PARA KOYEB
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -2087,6 +2776,8 @@ async def health_root(request: web.Request) -> web.Response:
             "twitch_channel": TWITCH_CHANNEL or None,
             "twitch_watcher_running": twitch_watch.is_running(),
             "twitch_clips_watcher_running": twitch_clips_watch.is_running(),
+            "event_watcher_running": event_watch.is_running(),
+            "starboard_threshold": STARBOARD_THRESHOLD,
         }
     )
 
@@ -2118,6 +2809,8 @@ class SetupBot(commands.Bot):
             twitch_watch.cancel()
         if twitch_clips_watch.is_running():
             twitch_clips_watch.cancel()
+        if event_watch.is_running():
+            event_watch.cancel()
         session = getattr(self, "twitch_session", None)
         if session is not None and not session.closed:
             await session.close()
@@ -2130,6 +2823,9 @@ class SetupBot(commands.Bot):
         self.add_view(TicketPanelView())
         self.add_view(CloseTicketView())
         self.add_view(PartyView())
+        self.add_view(SuggestionPanelView())
+        self.add_view(SuggestionStaffView())
+        self.add_view(EventView())
 
         if GUILD_ID:
             guild_obj = discord.Object(id=GUILD_ID)
@@ -2171,14 +2867,20 @@ async def on_ready():
         if guild is not None:
             try:
                 await cleanup_duplicate_system_messages(guild)
+                await cleanup_legacy_giveaway_role(guild)
                 await ensure_top_indicators(guild)
                 await ensure_invite_message(guild)
+                await ensure_suggestion_panel(guild)
             except (discord.Forbidden, discord.HTTPException) as exc:
                 print(f"⚠️ Limpieza/indicadores/invitación: {type(exc).__name__}: {exc}")
 
     if not member_counter_watch.is_running():
         member_counter_watch.start()
-    print("👥 Contador de miembros activo (eventos + respaldo cada 60s)")
+    print("👥 Contador de miembros activo (debounce 8s + respaldo cada 10m)")
+
+    if not event_watch.is_running():
+        event_watch.start()
+    print(f"🎉 Eventos automáticos activos ({EVENT_TIMEZONE})")
 
     if TWITCH_ENABLED:
         if not twitch_watch.is_running():
@@ -2195,6 +2897,9 @@ async def on_ready():
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
         return
+
+    await handle_suggestion_reaction(payload, added=True)
+    await handle_starboard_reaction(payload)
 
     guild, message, mapping, exclusive = await get_reaction_panel_mapping(payload)
     if guild is None or message is None or mapping is None:
@@ -2239,6 +2944,9 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
         return
+
+    await handle_suggestion_reaction(payload, added=False)
+    await handle_starboard_reaction(payload)
 
     guild, _message, mapping, _exclusive = await get_reaction_panel_mapping(payload)
     if guild is None or mapping is None:
@@ -2328,7 +3036,6 @@ async def setup_server(interaction: discord.Interaction):
         await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
         await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
         await ensure_role(guild, ROLE_EVENT_NOTIFY, no_perms, 0xF1C40F, False)
-        await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xFEE75C, False)
         for role_name in (ROLE_GAME_VALORANT, ROLE_GAME_MINECRAFT, ROLE_GAME_OTHER, ROLE_PLATFORM_PC, ROLE_PLATFORM_CONSOLE, ROLE_PLATFORM_MOBILE):
             await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
 
@@ -2539,9 +3246,12 @@ async def setup_server(interaction: discord.Interaction):
         ch_commands = await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
         ch_clips = await ensure_text_channel(guild, cat_community, CH_CLIPS, member_readonly, "Clips nuevos de Twitch publicados automáticamente.")
         ch_pets = await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de las mascotas de la comunidad.")
-        ch_suggestions = await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_text, "Ideas y sugerencias para mejorar la comunidad.")
+        ch_suggestions = await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_readonly, "Sugerencias con formulario, votos y estados del staff.")
+        ch_starboard = await ensure_text_channel(guild, cat_community, CH_STARBOARD, member_readonly, "Mensajes que alcanzan el mínimo de estrellas de la comunidad.")
+        ch_events = await ensure_text_channel(guild, cat_community, CH_EVENTS, member_readonly, "Eventos y customs organizados por el staff.")
         await ensure_top_indicators(guild)
         await ensure_invite_message(guild)
+        await ensure_suggestion_panel(guild)
 
         # ── Gaming ────────────────────────────────────────────────────────────
         ch_gaming = await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
@@ -2712,7 +3422,17 @@ async def setup_server(interaction: discord.Interaction):
         await ensure_guide(
             ch_suggestions,
             "Sugerencias",
-            "💡 Proponé ideas para el Discord, streams, eventos o juegos. Explicá tu idea con claridad y respetá las opiniones de los demás.",
+            "💡 Usá **Enviar sugerencia** para abrir el formulario. La comunidad vota con 👍/👎 y el staff puede marcarla como pendiente, en revisión, aceptada o rechazada.",
+        )
+        await ensure_guide(
+            ch_starboard,
+            "Destacados",
+            f"⭐ Los mensajes de la comunidad que alcancen **{STARBOARD_THRESHOLD} estrellas** aparecen automáticamente acá. Tu propia estrella no cuenta.",
+        )
+        await ensure_guide(
+            ch_events,
+            "Eventos",
+            "🎉 Eventos y customs de la comunidad. El staff los crea con `/evento`; podés anotarte con **Participar** y recibirás recordatorios si estás inscripto/a.",
         )
         await ensure_guide(
             ch_media,
@@ -2990,9 +3710,12 @@ async def update_channels_command(interaction: discord.Interaction):
     await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
     await ensure_text_channel(guild, cat_community, CH_CLIPS, member_readonly, "Clips nuevos de Twitch publicados automáticamente.")
     await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de las mascotas de la comunidad.")
-    await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_text, "Ideas y sugerencias para mejorar la comunidad.")
+    await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_readonly, "Sugerencias con formulario, votos y estados del staff.")
+    await ensure_text_channel(guild, cat_community, CH_STARBOARD, member_readonly, "Mensajes que alcanzan el mínimo de estrellas de la comunidad.")
+    await ensure_text_channel(guild, cat_community, CH_EVENTS, member_readonly, "Eventos y customs organizados por el staff.")
     await ensure_top_indicators(guild)
     await ensure_invite_message(guild)
+    await ensure_suggestion_panel(guild)
     await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
     await ensure_text_channel(guild, cat_gaming, CH_VALORANT, member_text, "Todo sobre Valorant.")
     await ensure_text_channel(guild, cat_gaming, CH_LFG, member_text, "Buscá duo, team o gente para jugar.")
@@ -3009,7 +3732,7 @@ async def update_channels_command(interaction: discord.Interaction):
     await set_progress(
         interaction,
         "✅ **Canales y permisos actualizados.**\n"
-        "💜 Quedaron listos los indicadores superiores, invitación, clips, mascotas, sugerencias y el canal exclusivo de la streamer.",
+        "💜 Quedaron listos indicadores, invitación, clips, mascotas, sugerencias, destacados, eventos y el canal exclusivo de la streamer.",
     )
 
 
@@ -3036,9 +3759,10 @@ async def update_roles_command(interaction: discord.Interaction):
         return await set_progress(interaction, "❌ No pude comprobar la jerarquía del bot.")
 
     await ensure_twitch_roles(guild)
+    await cleanup_legacy_giveaway_role(guild)
 
     no_perms = discord.Permissions.none()
-    for role_name in (ROLE_EVENT_NOTIFY, ROLE_GIVEAWAY_NOTIFY, ROLE_GAME_VALORANT, ROLE_GAME_MINECRAFT, ROLE_GAME_OTHER, ROLE_PLATFORM_PC, ROLE_PLATFORM_CONSOLE, ROLE_PLATFORM_MOBILE):
+    for role_name in (ROLE_EVENT_NOTIFY, ROLE_GAME_VALORANT, ROLE_GAME_MINECRAFT, ROLE_GAME_OTHER, ROLE_PLATFORM_PC, ROLE_PLATFORM_CONSOLE, ROLE_PLATFORM_MOBILE):
         await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
     for role_name in AGE_ROLES:
         await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
@@ -3163,7 +3887,7 @@ async def update_roles_command(interaction: discord.Interaction):
             "🎂 Rangos de edad sincronizados.\n"
             "🎖️ Rangos de Valorant sincronizados con los emojis personalizados.\n"
             "🎮 Juegos y plataformas listos.\n"
-            "📣 Avisos de directos, eventos y sorteos listos.",
+            "📣 Avisos de directos y eventos listos.",
         )
 
 
@@ -3190,7 +3914,9 @@ async def update_guides_command(interaction: discord.Interaction):
         (CH_COMMANDS, "Comandos y soporte", "Utilidades del bot. Para hablar en privado con el staff usá **Crear reporte**."),
         (CH_CLIPS, "Clips", "🎬 Los clips nuevos creados en el Twitch de la streamer aparecen **automáticamente** acá. Canal de solo lectura para mantenerlo ordenado."),
         (CH_PETS, "Mascotas", "🐾 Compartí fotos y videos de gatos, perros, hámsters y cualquier compañero animal. Con cariño y sin contenido desagradable."),
-        (CH_SUGGESTIONS, "Sugerencias", "💡 Proponé ideas para el Discord, streams, eventos o juegos. Explicá tu idea con claridad y respetá las opiniones."),
+        (CH_SUGGESTIONS, "Sugerencias", "💡 Usá **Enviar sugerencia** para abrir el formulario. La comunidad vota con 👍/👎 y el staff marca el estado."),
+        (CH_STARBOARD, "Destacados", f"⭐ Los mensajes que alcancen **{STARBOARD_THRESHOLD} estrellas** aparecen automáticamente acá. La estrella del autor no cuenta."),
+        (CH_EVENTS, "Eventos", "🎉 Eventos y customs. El staff usa `/evento`; los participantes pueden anotarse y reciben recordatorios."),
         (CH_GAMING, "Gaming", "Charlá sobre cualquier juego. Valorant tiene su canal propio."),
         (CH_VALORANT, "Valorant", "Rankeds, agentes, mapas, estrategias y partidas. Para armar grupo usá `🔎・busco-grupo`."),
         (CH_LFG, "Buscar grupo — Valorant", "Usá **`/party`** acá para crear una búsqueda. El bot toma tu rango y publica botones de **Unirme**, **Salir** y **Cerrar**."),
@@ -3269,6 +3995,63 @@ async def update_tickets_command(interaction: discord.Interaction):
     await set_progress(interaction, "✅ **Tickets actualizados.** El panel y la categoría privada están listos.")
 
 
+
+
+@bot.tree.command(name="evento", description="Crea un evento o custom para la comunidad.")
+@app_commands.guild_only()
+async def event_command(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not is_staff(interaction.user):
+        return await interaction.response.send_message("Solo el staff puede crear eventos.", ephemeral=True)
+    if find_text(interaction.guild, CH_EVENTS) is None:
+        return await interaction.response.send_message(
+            f"No encuentro `{CH_EVENTS}`. Ejecutá `/actualizar-canales` una vez.",
+            ephemeral=True,
+        )
+    await interaction.response.send_modal(EventModal())
+
+
+@bot.tree.command(name="clips-revisar", description="Fuerza una revisión inmediata de clips de Twitch.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def clips_check_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        published = await publish_new_twitch_clips(interaction.guild)
+        newest = ""
+        if _twitch_clips_last_newest_title:
+            newest = (
+                f"\nÚltimo detectado: **{safe_text(_twitch_clips_last_newest_title, 120)}**"
+                f"\nCreado: `{_twitch_clips_last_newest_created or 'desconocido'}`"
+            )
+        await set_progress(
+            interaction,
+            f"✅ Revisión completada. Twitch devolvió **{_twitch_clips_last_found}** clips dentro de las últimas "
+            f"**{TWITCH_CLIPS_LOOKBACK_MINUTES} min** y publiqué **{published}** nuevos.{newest}",
+        )
+    except Exception as exc:
+        await set_progress(interaction, f"❌ Error revisando clips: `{type(exc).__name__}: {str(exc)[:700]}`")
+
+
+@bot.tree.command(name="clips-estado", description="Muestra el diagnóstico del publicador automático de clips.")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def clips_status_command(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+    last = _twitch_clips_last_check_at.strftime("%Y-%m-%d %H:%M:%S UTC") if _twitch_clips_last_check_at else "todavía no"
+    lines = [
+        "🎬 **Estado de clips automáticos**",
+        f"Watcher: {'✅ activo' if twitch_clips_watch.is_running() else '⚠️ detenido'}",
+        f"Revisión: cada **{TWITCH_CLIPS_POLL_SECONDS}s**",
+        f"Ventana: últimos **{TWITCH_CLIPS_LOOKBACK_MINUTES} min**",
+        f"Última revisión: `{last}`",
+        f"Últimos encontrados: **{_twitch_clips_last_found}**",
+        f"Últimos publicados: **{_twitch_clips_last_published}**",
+        f"Último error: `{_twitch_clips_last_error or 'ninguno'}`",
+    ]
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="actualizar-twitch", description="Configura y comprueba la automatización de Twitch.")
@@ -3387,7 +4170,7 @@ async def twitch_status_command(interaction: discord.Interaction):
         f"Rol EN DIRECTO: {'✅ activo' if role_active else '— inactivo'}",
         f"Modo de prueba: {'🧪 ACTIVO' if _twitch_test_mode else '— inactivo'}",
         f"Chequeo del directo: cada {TWITCH_POLL_SECONDS}s",
-        f"Clips automáticos: {'✅ activos' if twitch_clips_watch.is_running() else '⚠️ detenidos'} (cada {TWITCH_CLIPS_POLL_SECONDS}s)",
+        f"Clips automáticos: {'✅ activos' if twitch_clips_watch.is_running() else '⚠️ detenidos'} (cada {TWITCH_CLIPS_POLL_SECONDS}s, ventana {TWITCH_CLIPS_LOOKBACK_MINUTES}m)",
     ]
     await set_progress(interaction, "\n".join(lines))
 
@@ -3646,8 +4429,7 @@ async def on_member_join(member: discord.Member):
         f"{member.mention} (`{member.id}`) se unió al servidor.",
         discord.Colour.green(),
     )
-    await asyncio.sleep(1)
-    await update_member_counter(member.guild)
+    await schedule_member_counter_update(member.guild, +1)
 
 
 @bot.event
@@ -3658,8 +4440,7 @@ async def on_member_remove(member: discord.Member):
         f"**{discord.utils.escape_markdown(str(member))}** (`{member.id}`) salió del servidor.",
         discord.Colour.orange(),
     )
-    await asyncio.sleep(1)
-    await update_member_counter(member.guild)
+    await schedule_member_counter_update(member.guild, -1)
 
 
 @bot.event
