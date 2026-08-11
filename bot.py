@@ -3,7 +3,7 @@ import asyncio
 import io
 import re
 import time
-from datetime import timedelta, timezone
+from datetime import timedelta
 from typing import Optional
 
 import discord
@@ -28,8 +28,8 @@ TWITCH_CHANNEL = os.getenv("TWITCH_CHANNEL", "").strip().lstrip("@").lower()
 STREAMER_DISCORD_ID = int(os.getenv("STREAMER_DISCORD_ID", "0") or 0)
 TWITCH_POLL_SECONDS = max(30, int(os.getenv("TWITCH_POLL_SECONDS", "60") or 60))
 TWITCH_OFFLINE_DELETE_DELAY = max(0, int(os.getenv("TWITCH_OFFLINE_DELETE_DELAY", "300") or 300))
-TWITCH_CLIP_POLL_SECONDS = max(60, int(os.getenv("TWITCH_CLIP_POLL_SECONDS", "120") or 120))
-TWITCH_CLIP_LOOKBACK_SECONDS = max(300, int(os.getenv("TWITCH_CLIP_LOOKBACK_SECONDS", "900") or 900))
+TWITCH_CLIPS_POLL_SECONDS = max(60, int(os.getenv("TWITCH_CLIPS_POLL_SECONDS", "120") or 120))
+TWITCH_CLIPS_LOOKBACK_MINUTES = max(5, int(os.getenv("TWITCH_CLIPS_LOOKBACK_MINUTES", "20") or 20))
 TWITCH_ENABLED = bool(TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and TWITCH_CHANNEL)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -45,8 +45,6 @@ _twitch_was_live: Optional[bool] = None
 _twitch_last_stream_id: Optional[str] = None
 _twitch_delete_task: Optional[asyncio.Task] = None
 _twitch_broadcaster_id: Optional[str] = None
-_clip_seen_ids: set[str] = set()
-_member_counter_tasks: dict[int, asyncio.Task] = {}
 
 # Mientras esta bandera está activa, el watcher real de Twitch no modifica
 # el estado simulado. /twitch-fin-prueba vuelve a sincronizar con Twitch real.
@@ -154,153 +152,6 @@ async def fetch_twitch_stream() -> Optional[dict]:
     return streams[0] if streams else None
 
 
-def _rfc3339_utc(dt) -> str:
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-async def get_twitch_broadcaster_id(force_refresh: bool = False) -> str:
-    """Resuelve y cachea el ID numérico de TWITCH_CHANNEL."""
-    global _twitch_broadcaster_id
-    if _twitch_broadcaster_id and not force_refresh:
-        return _twitch_broadcaster_id
-
-    token = await get_twitch_app_token(force_refresh=force_refresh)
-    session = await twitch_session()
-    async with session.get(
-        "https://api.twitch.tv/helix/users",
-        params={"login": TWITCH_CHANNEL},
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Client-Id": TWITCH_CLIENT_ID,
-        },
-    ) as response:
-        data = await response.json(content_type=None)
-        if response.status == 401 and not force_refresh:
-            return await get_twitch_broadcaster_id(force_refresh=True)
-        if response.status != 200:
-            raise RuntimeError(f"Twitch Get Users devolvió HTTP {response.status}: {data}")
-
-    users = data.get("data") or []
-    if not users:
-        raise RuntimeError(f"Twitch no encontró el canal @{TWITCH_CHANNEL}")
-    _twitch_broadcaster_id = str(users[0]["id"])
-    return _twitch_broadcaster_id
-
-
-async def fetch_recent_twitch_clips() -> list[dict]:
-    """Obtiene clips creados recientemente en el canal configurado."""
-    broadcaster_id = await get_twitch_broadcaster_id()
-    token = await get_twitch_app_token()
-    session = await twitch_session()
-    now = discord.utils.utcnow()
-    started_at = now - timedelta(seconds=TWITCH_CLIP_LOOKBACK_SECONDS)
-
-    async def request(current_token: str):
-        return await session.get(
-            "https://api.twitch.tv/helix/clips",
-            params={
-                "broadcaster_id": broadcaster_id,
-                "first": 100,
-                "started_at": _rfc3339_utc(started_at),
-                "ended_at": _rfc3339_utc(now),
-            },
-            headers={
-                "Authorization": f"Bearer {current_token}",
-                "Client-Id": TWITCH_CLIENT_ID,
-            },
-        )
-
-    response = await request(token)
-    if response.status == 401:
-        response.release()
-        token = await get_twitch_app_token(force_refresh=True)
-        response = await request(token)
-
-    async with response:
-        data = await response.json(content_type=None)
-        if response.status != 200:
-            raise RuntimeError(f"Twitch Get Clips devolvió HTTP {response.status}: {data}")
-    return list(data.get("data") or [])
-
-
-def twitch_clip_embed(clip: dict) -> discord.Embed:
-    title = safe_text(clip.get("title") or "Nuevo clip", 250)
-    creator = safe_text(clip.get("creator_name") or "Desconocido", 100)
-    broadcaster = safe_text(clip.get("broadcaster_name") or TWITCH_CHANNEL or "Streamer", 100)
-    clip_url = clip.get("url") or twitch_url()
-    embed = discord.Embed(
-        title=f"🎬 Nuevo clip de {broadcaster}",
-        description=f"**{title}**",
-        url=clip_url,
-        colour=discord.Colour.purple(),
-        timestamp=discord.utils.utcnow(),
-    )
-    embed.add_field(name="✂️ Creado por", value=creator, inline=True)
-    if clip.get("view_count") is not None:
-        embed.add_field(name="👀 Vistas", value=str(clip.get("view_count", 0)), inline=True)
-    duration = clip.get("duration")
-    if duration is not None:
-        try:
-            embed.add_field(name="⏱️ Duración", value=f"{float(duration):.1f}s", inline=True)
-        except (TypeError, ValueError):
-            pass
-    thumbnail = clip.get("thumbnail_url")
-    if thumbnail:
-        embed.set_image(url=thumbnail)
-    clip_id = str(clip.get("id") or "")
-    embed.set_footer(text=f"Twitch clip ID: {clip_id}")
-    return embed
-
-
-def twitch_clip_view(clip: dict) -> discord.ui.View:
-    view = discord.ui.View(timeout=None)
-    view.add_item(
-        discord.ui.Button(
-            label="Ver clip",
-            emoji="🎬",
-            style=discord.ButtonStyle.link,
-            url=clip.get("url") or twitch_url(),
-        )
-    )
-    return view
-
-
-async def clip_already_announced(channel: discord.TextChannel, clip_id: str) -> bool:
-    wanted = f"Twitch clip ID: {clip_id}"
-    try:
-        async for msg in channel.history(limit=120):
-            if msg.author != channel.guild.me or not msg.embeds:
-                continue
-            footer = msg.embeds[0].footer
-            if footer and footer.text == wanted:
-                return True
-    except discord.Forbidden:
-        pass
-    return False
-
-
-async def send_clip_announcement(guild: discord.Guild, clip: dict) -> bool:
-    channel = find_text(guild, CH_CLIPS)
-    if channel is None:
-        return False
-    clip_id = str(clip.get("id") or "")
-    if not clip_id or clip_id in _clip_seen_ids:
-        return False
-    if await clip_already_announced(channel, clip_id):
-        _clip_seen_ids.add(clip_id)
-        return False
-    try:
-        await channel.send(
-            embed=twitch_clip_embed(clip),
-            view=twitch_clip_view(clip),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except discord.Forbidden:
-        return False
-    _clip_seen_ids.add(clip_id)
-    return True
-
-
 async def ensure_twitch_roles(guild: discord.Guild) -> tuple[discord.Role, discord.Role]:
     no_perms = discord.Permissions.none()
     live_role = await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
@@ -346,15 +197,19 @@ async def ensure_twitch_notify_panel(guild: discord.Guild) -> Optional[discord.M
         return None
 
     await ensure_twitch_roles(guild)
+    no_perms = discord.Permissions.none()
+    await ensure_role(guild, ROLE_EVENT_NOTIFY, no_perms, 0xF1C40F, False)
+    await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xFEE75C, False)
+    lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in NOTIFY_REACTION_ROLES.items())
     return await ensure_reaction_role_panel(
         channel,
         ROLE_PANEL_NOTIFY_TITLE,
         (
-            "↳ **¿Querés que Discord te avise cuando empiece el stream?**\n\n"
-            "🔔 ─ reaccioná para recibir el rol de avisos.\n\n"
-            "Podés quitar la reacción cuando quieras para dejar de recibir menciones."
+            "↳ **Elegí qué avisos querés recibir.** Podés marcar más de uno.\n\n"
+            f"{lines}\n\n"
+            "Quitá una reacción cuando quieras dejar de recibir ese aviso."
         ),
-        STREAM_NOTIFY_REACTION_ROLES,
+        NOTIFY_REACTION_ROLES,
     )
 
 
@@ -777,6 +632,175 @@ async def handle_twitch_offline(guild: discord.Guild) -> None:
     _twitch_last_stream_id = None
 
 
+
+async def get_twitch_broadcaster_id(force_refresh: bool = False) -> str:
+    """Resuelve y cachea el ID numérico del canal configurado en Twitch."""
+    global _twitch_broadcaster_id
+    if _twitch_broadcaster_id and not force_refresh:
+        return _twitch_broadcaster_id
+
+    token = await get_twitch_app_token()
+    session = await twitch_session()
+    async with session.get(
+        "https://api.twitch.tv/helix/users",
+        params={"login": TWITCH_CHANNEL},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Client-Id": TWITCH_CLIENT_ID,
+        },
+    ) as response:
+        data = await response.json(content_type=None)
+        if response.status != 200:
+            raise RuntimeError(f"Twitch Get Users devolvió HTTP {response.status}: {data}")
+
+    users = data.get("data") or []
+    if not users:
+        raise RuntimeError(f"No existe el canal de Twitch @{TWITCH_CHANNEL}")
+    _twitch_broadcaster_id = str(users[0]["id"])
+    return _twitch_broadcaster_id
+
+
+async def fetch_recent_twitch_clips() -> list[dict]:
+    """Obtiene clips recientes del canal para publicarlos automáticamente."""
+    broadcaster_id = await get_twitch_broadcaster_id()
+    token = await get_twitch_app_token()
+    session = await twitch_session()
+
+    now = discord.utils.utcnow()
+    started = now - timedelta(minutes=TWITCH_CLIPS_LOOKBACK_MINUTES)
+    params = {
+        "broadcaster_id": broadcaster_id,
+        "started_at": started.isoformat().replace("+00:00", "Z"),
+        "ended_at": now.isoformat().replace("+00:00", "Z"),
+        "first": "100",
+    }
+
+    async with session.get(
+        "https://api.twitch.tv/helix/clips",
+        params=params,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Client-Id": TWITCH_CLIENT_ID,
+        },
+    ) as response:
+        data = await response.json(content_type=None)
+        if response.status == 401:
+            # Renueva el token una vez si expiró entre consultas.
+            token = await get_twitch_app_token(force_refresh=True)
+            async with session.get(
+                "https://api.twitch.tv/helix/clips",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Client-Id": TWITCH_CLIENT_ID,
+                },
+            ) as retry:
+                data = await retry.json(content_type=None)
+                if retry.status != 200:
+                    raise RuntimeError(f"Twitch Get Clips devolvió HTTP {retry.status}: {data}")
+        elif response.status != 200:
+            raise RuntimeError(f"Twitch Get Clips devolvió HTTP {response.status}: {data}")
+
+    clips = data.get("data") or []
+    return sorted(clips, key=lambda clip: clip.get("created_at") or "")
+
+
+def twitch_clip_embed(clip: dict) -> discord.Embed:
+    title = clip.get("title") or "Nuevo clip"
+    creator = clip.get("creator_name") or "Desconocido"
+    views = int(clip.get("view_count") or 0)
+    url = clip.get("url") or twitch_url()
+    clip_id = str(clip.get("id") or "")
+
+    embed = discord.Embed(
+        title=f"🎬 Nuevo clip de {clip.get('broadcaster_name') or TWITCH_CHANNEL}",
+        url=url,
+        description=f"**{safe_text(title, 500)}**",
+        colour=discord.Colour.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="✂️ Creado por", value=safe_text(creator, 100), inline=True)
+    embed.add_field(name="👀 Vistas", value=str(views), inline=True)
+    created = clip.get("created_at")
+    if created:
+        embed.add_field(name="🕒 Creado", value=created.replace("T", " ").replace("Z", " UTC"), inline=False)
+    thumbnail = clip.get("thumbnail_url")
+    if thumbnail:
+        embed.set_image(url=thumbnail)
+    embed.set_footer(text=f"Twitch clip ID: {clip_id}")
+    return embed
+
+
+def twitch_clip_view(clip: dict) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(
+        discord.ui.Button(
+            label="Ver clip",
+            emoji="🟣",
+            style=discord.ButtonStyle.link,
+            url=clip.get("url") or twitch_url(),
+        )
+    )
+    return view
+
+
+async def clip_already_posted(channel: discord.TextChannel, clip_id: str) -> bool:
+    wanted = f"Twitch clip ID: {clip_id}"
+    try:
+        async for msg in channel.history(limit=100):
+            if msg.author != channel.guild.me:
+                continue
+            for embed in msg.embeds:
+                if embed.footer and embed.footer.text == wanted:
+                    return True
+    except discord.Forbidden:
+        return False
+    return False
+
+
+async def publish_new_twitch_clips(guild: discord.Guild) -> int:
+    channel = find_text(guild, CH_CLIPS)
+    if channel is None:
+        return 0
+
+    clips = await fetch_recent_twitch_clips()
+    published = 0
+    for clip in clips:
+        clip_id = str(clip.get("id") or "")
+        if not clip_id or await clip_already_posted(channel, clip_id):
+            continue
+        try:
+            await channel.send(
+                embed=twitch_clip_embed(clip),
+                view=twitch_clip_view(clip),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            published += 1
+        except discord.Forbidden:
+            break
+    return published
+
+
+@tasks.loop(seconds=TWITCH_CLIPS_POLL_SECONDS)
+async def twitch_clips_watch():
+    if not TWITCH_ENABLED or not GUILD_ID:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    try:
+        await publish_new_twitch_clips(guild)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"⚠️ Twitch clips watcher: {type(exc).__name__}: {exc}")
+
+
+@twitch_clips_watch.before_loop
+async def before_twitch_clips_watch():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(seconds=TWITCH_POLL_SECONDS)
 async def twitch_watch():
     if _twitch_test_mode:
@@ -805,31 +829,6 @@ async def before_twitch_watch():
     await bot.wait_until_ready()
 
 
-@tasks.loop(seconds=TWITCH_CLIP_POLL_SECONDS)
-async def twitch_clip_watch():
-    if not TWITCH_ENABLED or not GUILD_ID:
-        return
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None or find_text(guild, CH_CLIPS) is None:
-        return
-    try:
-        clips = await fetch_recent_twitch_clips()
-        # Get Clips no garantiza orden por creación: los ordenamos para publicar
-        # primero los más antiguos dentro de la ventana reciente.
-        clips.sort(key=lambda item: item.get("created_at") or "")
-        for clip in clips:
-            await send_clip_announcement(guild, clip)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        print(f"⚠️ Twitch clips watcher: {type(exc).__name__}: {exc}")
-
-
-@twitch_clip_watch.before_loop
-async def before_twitch_clip_watch():
-    await bot.wait_until_ready()
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 
 ROLE_MEMBER = "✅・Miembro"
@@ -845,33 +844,12 @@ ROLE_LIVE = "🔴・EN DIRECTO"
 ROLE_LIVE_NOTIFY = "🔔・Avisos de directo"
 ROLE_EVENT_NOTIFY = "🎉・Avisos de eventos"
 ROLE_GIVEAWAY_NOTIFY = "🎁・Avisos de sorteos"
-
-GAME_ROLES = [
-    "🔫・Valorant",
-    "⛏️・Minecraft",
-    "🎮・Otros juegos",
-]
-GAME_REACTION_ROLES = {
-    "🔫": "🔫・Valorant",
-    "⛏️": "⛏️・Minecraft",
-    "🎮": "🎮・Otros juegos",
-}
-
-PLATFORM_ROLES = [
-    "🖥️・PC",
-    "🎮・Consola",
-    "📱・Mobile",
-]
-PLATFORM_REACTION_ROLES = {
-    "🖥️": "🖥️・PC",
-    "🎮": "🎮・Consola",
-    "📱": "📱・Mobile",
-}
-
-EXTRA_NOTIFY_REACTION_ROLES = {
-    "🎉": ROLE_EVENT_NOTIFY,
-    "🎁": ROLE_GIVEAWAY_NOTIFY,
-}
+ROLE_GAME_VALORANT = "🔫・Valorant"
+ROLE_GAME_MINECRAFT = "⛏️・Minecraft"
+ROLE_GAME_OTHER = "🎮・Otros juegos"
+ROLE_PLATFORM_PC = "🖥️・PC"
+ROLE_PLATFORM_CONSOLE = "🎮・Consola"
+ROLE_PLATFORM_MOBILE = "📱・Mobile"
 
 # Roles visuales de edad. No guardan la edad exacta, solo un rango general.
 AGE_ROLES = [
@@ -935,16 +913,14 @@ VALORANT_CUSTOM_EMOJIS = {
 ROLE_PANEL_COUNTRY_TITLE = "🌎 Elegí tu país"
 ROLE_PANEL_AGE_TITLE = "🎂 Elegí tu rango de edad"
 ROLE_PANEL_RANK_TITLE = "🔫 Elegí tu rango de Valorant"
-ROLE_PANEL_NOTIFY_TITLE = "🔔 Avisos de directo"
-ROLE_PANEL_GAMES_TITLE = "🎮 Juegos que te interesan"
-ROLE_PANEL_PLATFORM_TITLE = "🖥️ Dónde jugás"
-ROLE_PANEL_EXTRA_NOTIFY_TITLE = "📣 Otros avisos"
+ROLE_PANEL_GAMES_TITLE = "🎮 Elegí tus juegos"
+ROLE_PANEL_PLATFORM_TITLE = "🖥️ Elegí tus plataformas"
+ROLE_PANEL_NOTIFY_TITLE = "📣 Elegí tus avisos"
+LEGACY_ROLE_PANEL_NOTIFY_TITLE = "🔔 Avisos de directo"
+GAME_REACTION_ROLES = {"🔫": ROLE_GAME_VALORANT, "⛏️": ROLE_GAME_MINECRAFT, "🎮": ROLE_GAME_OTHER}
+PLATFORM_REACTION_ROLES = {"🖥️": ROLE_PLATFORM_PC, "🎮": ROLE_PLATFORM_CONSOLE, "📱": ROLE_PLATFORM_MOBILE}
+NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY, "🎉": ROLE_EVENT_NOTIFY, "🎁": ROLE_GIVEAWAY_NOTIFY}
 STREAM_NOTIFY_REACTION_ROLES = {"🔔": ROLE_LIVE_NOTIFY}
-EXCLUSIVE_REACTION_PANEL_TITLES = {
-    ROLE_PANEL_COUNTRY_TITLE,
-    ROLE_PANEL_AGE_TITLE,
-    ROLE_PANEL_RANK_TITLE,
-}
 GUIDE_PREFIX = "📌 Guía — "
 
 CAT_INFO = "╭・📌 INFORMACIÓN"
@@ -960,10 +936,7 @@ CH_ROLES = "🎭・roles"
 CH_ANNOUNCEMENTS = "📢・anuncios"
 CH_STREAMS = "🎥・directos"
 CH_STREAMER_ONLY = "💜・aqui-solo-habla-la-streamer"
-CH_INVITE = "🔗・invitar-amigos"
 CH_LIVE = "🔴・stream-en-vivo"
-MEMBER_COUNTER_PREFIX = "👥・"
-MEMBER_COUNTER_SUFFIX = " miembros"
 
 CH_GENERAL = "💬・general"
 CH_MEDIA = "📸・multimedia"
@@ -972,6 +945,7 @@ CH_COMMANDS = "🤖・comandos"
 CH_CLIPS = "🎬・clips"
 CH_PETS = "🐾・mascotas"
 CH_SUGGESTIONS = "💡・sugerencias"
+CH_INVITE = "🔗・invitar-amigos"
 
 CH_GAMING = "🎮・gaming"
 CH_VALORANT = "🔫・valorant"
@@ -982,6 +956,7 @@ VC_GAMING = "🎮・Gaming"
 VC_VALORANT = "🔫・Valorant"
 VC_CREATE = "➕・Crear sala"
 VC_LIVE = "🔴・EN DIRECTO | RESPETO"
+VC_INVITE_INDICATOR = "🔗 Invitar Amigos"
 TEMP_VC_PREFIX = "🎮・Sala de "
 
 CH_STAFF = "💬・staff"
@@ -1007,17 +982,6 @@ def find_text(guild: discord.Guild, name: str) -> Optional[discord.TextChannel]:
 
 def find_voice(guild: discord.Guild, name: str) -> Optional[discord.VoiceChannel]:
     return discord.utils.get(guild.voice_channels, name=name)
-
-
-def find_member_counter_channel(guild: discord.Guild) -> Optional[discord.VoiceChannel]:
-    for channel in guild.voice_channels:
-        if channel.name.startswith(MEMBER_COUNTER_PREFIX) and channel.name.endswith(MEMBER_COUNTER_SUFFIX):
-            return channel
-    return None
-
-
-def human_member_count(guild: discord.Guild) -> int:
-    return sum(1 for member in guild.members if not member.bot)
 
 
 def build_rank_reaction_roles(guild: discord.Guild) -> dict[str, str]:
@@ -1142,73 +1106,114 @@ async def ensure_voice_channel(
     return channel
 
 
-async def ensure_member_counter_channel(
-    guild: discord.Guild,
-    category: discord.CategoryChannel,
-) -> discord.VoiceChannel:
-    name = f"{MEMBER_COUNTER_PREFIX}{human_member_count(guild)}{MEMBER_COUNTER_SUFFIX}"
-    channel = find_member_counter_channel(guild)
-    overwrites = {
+
+def member_counter_name(guild: discord.Guild) -> str:
+    count = guild.member_count if guild.member_count is not None else len(guild.members)
+    return f"💜 {count} Miembros 💜"
+
+
+def find_member_counter_voice(guild: discord.Guild) -> Optional[discord.VoiceChannel]:
+    # Acepta el formato nuevo y migra contadores viejos como "👥・7 miembros".
+    for channel in guild.voice_channels:
+        lower = channel.name.lower()
+        if "miembro" in lower and any(char.isdigit() for char in channel.name):
+            return channel
+    return None
+
+
+def indicator_overwrites(guild: discord.Guild) -> dict:
+    return {
         guild.default_role: discord.PermissionOverwrite(
-            view_channel=True, connect=False, speak=False
+            view_channel=True,
+            connect=False,
+            speak=False,
+            stream=False,
         )
     }
-    if channel is None:
-        channel = await guild.create_voice_channel(
-            name=name,
-            category=category,
+
+
+async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:
+    """Crea/migra los dos indicadores bloqueados y los deja sin categoría arriba."""
+    overwrites = indicator_overwrites(guild)
+    wanted_count = member_counter_name(guild)
+
+    counter = find_member_counter_voice(guild)
+    if counter is None:
+        counter = await guild.create_voice_channel(
+            wanted_count,
+            category=None,
+            position=0,
             overwrites=overwrites,
-            reason="Contador automático de miembros",
+            reason="Contador visual de miembros",
         )
     else:
-        changes = {}
-        if channel.name != name:
-            changes["name"] = name
-        if channel.category_id != category.id:
-            changes["category"] = category
-        changes["overwrites"] = overwrites
-        if changes:
-            await channel.edit(reason="Actualización del contador de miembros", **changes)
+        needs_edit = counter.name != wanted_count or counter.category is not None
+        if needs_edit:
+            await counter.edit(
+                name=wanted_count,
+                category=None,
+                position=0,
+                overwrites=overwrites,
+                reason="Actualizar contador visual de miembros",
+            )
+        else:
+            await counter.edit(position=0, overwrites=overwrites, reason="Acomodar contador visual")
+
+    invite_indicator = find_voice(guild, VC_INVITE_INDICATOR)
+    if invite_indicator is None:
+        invite_indicator = next((vc for vc in guild.voice_channels if "invitar amigos" in vc.name.lower()), None)
+    if invite_indicator is None:
+        invite_indicator = await guild.create_voice_channel(
+            VC_INVITE_INDICATOR,
+            category=None,
+            position=1,
+            overwrites=overwrites,
+            reason="Indicador visual de invitación",
+        )
+    else:
+        await invite_indicator.edit(
+            category=None,
+            position=1,
+            overwrites=overwrites,
+            reason="Acomodar indicador de invitación",
+        )
+
+    # Discord separa el orden de canales de voz/texto; volver a moverlos deja
+    # ambos indicadores consecutivos en el bloque de voz sin categoría.
     try:
-        await channel.edit(position=0, reason="Mostrar contador arriba")
-    except (discord.Forbidden, discord.HTTPException):
+        await counter.edit(position=0, reason="Indicadores arriba del servidor")
+        await invite_indicator.edit(position=1, reason="Indicadores arriba del servidor")
+    except discord.HTTPException:
         pass
-    return channel
+    return counter, invite_indicator
 
 
-async def update_member_counter_channel(guild: discord.Guild) -> None:
-    channel = find_member_counter_channel(guild)
+async def update_member_counter(guild: discord.Guild) -> None:
+    channel = find_member_counter_voice(guild)
     if channel is None:
         return
-    wanted = f"{MEMBER_COUNTER_PREFIX}{human_member_count(guild)}{MEMBER_COUNTER_SUFFIX}"
-    if channel.name == wanted:
-        return
+    wanted = member_counter_name(guild)
+    if channel.name != wanted:
+        try:
+            await channel.edit(name=wanted, reason="Actualizar cantidad de miembros")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+
+async def get_or_create_invite_url(guild: discord.Guild, target: discord.TextChannel) -> Optional[str]:
+    if DISCORD_INVITE_URL:
+        return DISCORD_INVITE_URL
+
     try:
-        await channel.edit(name=wanted, reason="Actualización automática del contador")
+        invites = await guild.invites()
+        for invite in invites:
+            if invite.max_age == 0 and invite.max_uses == 0 and invite.channel and invite.channel.id == target.id:
+                return invite.url
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-
-def schedule_member_counter_update(guild: discord.Guild) -> None:
-    current = _member_counter_tasks.get(guild.id)
-    if current is not None and not current.done():
-        return
-
-    async def delayed_update():
-        try:
-            await asyncio.sleep(3)
-            await update_member_counter_channel(guild)
-        finally:
-            _member_counter_tasks.pop(guild.id, None)
-
-    _member_counter_tasks[guild.id] = asyncio.create_task(delayed_update())
-
-
-async def ensure_server_invite(guild: discord.Guild, channel: discord.TextChannel) -> Optional[str]:
-    if DISCORD_INVITE_URL:
-        return DISCORD_INVITE_URL
     try:
-        invite = await channel.create_invite(
+        invite = await target.create_invite(
             max_age=0,
             max_uses=0,
             unique=False,
@@ -1219,51 +1224,27 @@ async def ensure_server_invite(guild: discord.Guild, channel: discord.TextChanne
         return None
 
 
-async def ensure_invite_panel(channel: discord.TextChannel, invite_url: Optional[str]) -> discord.Message:
-    title = "🔗 Invitá a tus amigos"
-    message = await find_bot_embed_message(channel, title)
-    link_text = invite_url or "⚠️ No pude generar el enlace automáticamente. Revisá el permiso **Crear invitación** del bot."
-    embed = discord.Embed(
-        title=title,
-        description=(
-            "> ¿Conocés a alguien que disfrutaría de la comunidad? 💜\n\n"
-            "Compartile nuestra invitación oficial:\n\n"
-            f"### {link_text}\n\n"
-            "✨ Invitá solamente a personas que vayan a respetar las reglas."
-        ),
-        colour=discord.Colour.purple(),
-    )
-    if message is None:
-        return await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    await message.edit(embed=embed)
-    return message
-
-
-async def send_welcome_message(member: discord.Member) -> None:
-    channel = find_text(member.guild, CH_GENERAL)
-    if channel is None:
+async def ensure_invite_message(guild: discord.Guild) -> None:
+    channel = find_text(guild, CH_INVITE)
+    verify_channel = find_text(guild, CH_VERIFY)
+    if channel is None or verify_channel is None:
         return
-    embed = discord.Embed(
-        title=f"💜 ¡Bienvenido/a, {safe_text(member.display_name, 80)}!",
-        description=(
-            f"{member.mention} ya forma parte de la comunidad de **s0ftbl4de**.\n\n"
-            f"🎭 Elegí tus roles en {find_text(member.guild, CH_ROLES).mention if find_text(member.guild, CH_ROLES) else '`🎭・roles`'}\n"
-            f"📜 Revisá las reglas en {find_text(member.guild, CH_RULES).mention if find_text(member.guild, CH_RULES) else '`📜・reglas`'}\n"
-            "💬 Y cuando quieras, presentate por acá."
-        ),
-        colour=discord.Colour.purple(),
-        timestamp=discord.utils.utcnow(),
+    url = await get_or_create_invite_url(guild, verify_channel)
+    description = (
+        "¿Conocés a alguien que disfrutaría de la comunidad? 💜\n\n"
+        + (f"### 🔗 {url}\n\nCompartí este enlace para invitarlo al servidor." if url else "⚠️ No pude crear la invitación. Dale al bot el permiso **Crear invitación** o configurá `DISCORD_INVITE_URL` en Northflank.")
     )
-    if member.display_avatar:
-        embed.set_thumbnail(url=member.display_avatar.url)
-    embed.set_footer(text=f"Ahora somos {human_member_count(member.guild)} miembros 💜")
-    try:
-        await channel.send(
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
-        )
-    except discord.Forbidden:
-        pass
+    title = "💜 Invitá a tus amigos"
+    message = await find_bot_embed_message(channel, title)
+    embed = discord.Embed(title=title, description=description, colour=discord.Colour.purple())
+    if message is None:
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        try:
+            await message.edit(embed=embed)
+        except discord.Forbidden:
+            pass
+
 
 
 async def ensure_guide(
@@ -1343,74 +1324,37 @@ async def ensure_reaction_role_panel(
     return message
 
 
-async def ensure_extra_role_panels(guild: discord.Guild, channel: discord.TextChannel) -> None:
-    game_lines = "\n".join(
-        f"{emoji} ─ {find_role(guild, role_name).mention if find_role(guild, role_name) else role_name}"
-        for emoji, role_name in GAME_REACTION_ROLES.items()
-    )
-    await ensure_reaction_role_panel(
-        channel,
-        ROLE_PANEL_GAMES_TITLE,
-        "↳ **Marcá los juegos que te interesan.** Podés elegir varios.\n\n" + game_lines,
-        GAME_REACTION_ROLES,
-    )
-
-    platform_lines = "\n".join(
-        f"{emoji} ─ {find_role(guild, role_name).mention if find_role(guild, role_name) else role_name}"
-        for emoji, role_name in PLATFORM_REACTION_ROLES.items()
-    )
-    await ensure_reaction_role_panel(
-        channel,
-        ROLE_PANEL_PLATFORM_TITLE,
-        "↳ **¿Dónde jugás?** Podés marcar más de una plataforma.\n\n" + platform_lines,
-        PLATFORM_REACTION_ROLES,
-    )
-
-    notify_lines = "\n".join(
-        f"{emoji} ─ {find_role(guild, role_name).mention if find_role(guild, role_name) else role_name}"
-        for emoji, role_name in EXTRA_NOTIFY_REACTION_ROLES.items()
-    )
-    await ensure_reaction_role_panel(
-        channel,
-        ROLE_PANEL_EXTRA_NOTIFY_TITLE,
-        "↳ **Elegí qué otros avisos querés recibir.** Podés activar ambos.\n\n" + notify_lines,
-        EXTRA_NOTIFY_REACTION_ROLES,
-    )
-
-
 async def get_reaction_panel_mapping(payload: discord.RawReactionActionEvent):
     guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
     if guild is None:
-        return None, None, None
+        return None, None, None, False
 
     channel = guild.get_channel(payload.channel_id)
     if not isinstance(channel, discord.TextChannel) or channel.name != CH_ROLES:
-        return guild, None, None
+        return guild, None, None, False
 
     try:
         message = await channel.fetch_message(payload.message_id)
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return guild, None, None
+        return guild, None, None, False
 
     if not message.embeds:
-        return guild, message, None
+        return guild, message, None, False
 
     title = message.embeds[0].title
     if title == ROLE_PANEL_COUNTRY_TITLE:
-        return guild, message, COUNTRY_REACTION_ROLES
+        return guild, message, COUNTRY_REACTION_ROLES, True
     if title == ROLE_PANEL_AGE_TITLE:
-        return guild, message, AGE_REACTION_ROLES
+        return guild, message, AGE_REACTION_ROLES, True
     if title == ROLE_PANEL_RANK_TITLE:
-        return guild, message, build_rank_reaction_roles(guild)
-    if title == ROLE_PANEL_NOTIFY_TITLE:
-        return guild, message, STREAM_NOTIFY_REACTION_ROLES
+        return guild, message, build_rank_reaction_roles(guild), True
     if title == ROLE_PANEL_GAMES_TITLE:
-        return guild, message, GAME_REACTION_ROLES
+        return guild, message, GAME_REACTION_ROLES, False
     if title == ROLE_PANEL_PLATFORM_TITLE:
-        return guild, message, PLATFORM_REACTION_ROLES
-    if title == ROLE_PANEL_EXTRA_NOTIFY_TITLE:
-        return guild, message, EXTRA_NOTIFY_REACTION_ROLES
-    return guild, message, None
+        return guild, message, PLATFORM_REACTION_ROLES, False
+    if title in {ROLE_PANEL_NOTIFY_TITLE, LEGACY_ROLE_PANEL_NOTIFY_TITLE}:
+        return guild, message, NOTIFY_REACTION_ROLES, False
+    return guild, message, None, False
 
 
 async def reaction_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
@@ -1500,6 +1444,33 @@ async def send_report_staff(
         pass
 
 
+
+async def send_welcome(member: discord.Member) -> None:
+    channel = find_text(member.guild, CH_GENERAL)
+    if channel is None:
+        return
+    count = member.guild.member_count if member.guild.member_count is not None else len(member.guild.members)
+    embed = discord.Embed(
+        title="💜 ¡Bienvenido/a a la comunidad!",
+        description=(
+            f"¡Hola {member.mention}! Ya sos parte del servidor de **{TWITCH_CHANNEL or 's0ftbl4de'}**.\n\n"
+            "🎭 Elegí tus roles en **#roles**\n"
+            "💬 Pasate por **#general**\n"
+            "📜 Recordá respetar las reglas\n\n"
+            f"✨ Ahora somos **{count} miembros**."
+        ),
+        colour=discord.Colour.purple(),
+        timestamp=discord.utils.utcnow(),
+    )
+    try:
+        await channel.send(
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PANELES PERSISTENTES
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1540,7 +1511,8 @@ class VerifyView(discord.ui.View):
                 "¡Listo! Ya tenés acceso al servidor ✅",
                 ephemeral=True,
             )
-            await send_welcome_message(interaction.user)
+            await send_welcome(interaction.user)
+            await update_member_counter(interaction.guild)
         except discord.Forbidden:
             await interaction.response.send_message(
                 "No pude darte el rol. Revisá que mi rol esté por encima de ✅・Miembro.",
@@ -2009,7 +1981,7 @@ async def health_root(request: web.Request) -> web.Response:
             "twitch_enabled": TWITCH_ENABLED,
             "twitch_channel": TWITCH_CHANNEL or None,
             "twitch_watcher_running": twitch_watch.is_running(),
-            "twitch_clip_watcher_running": twitch_clip_watch.is_running(),
+            "twitch_clips_watcher_running": twitch_clips_watch.is_running(),
         }
     )
 
@@ -2039,8 +2011,8 @@ class SetupBot(commands.Bot):
     async def close(self):
         if twitch_watch.is_running():
             twitch_watch.cancel()
-        if twitch_clip_watch.is_running():
-            twitch_clip_watch.cancel()
+        if twitch_clips_watch.is_running():
+            twitch_clips_watch.cancel()
         session = getattr(self, "twitch_session", None)
         if session is not None and not session.closed:
             await session.close()
@@ -2092,17 +2064,19 @@ async def on_ready():
     if GUILD_ID:
         guild = bot.get_guild(GUILD_ID)
         if guild is not None:
-            await update_member_counter_channel(guild)
+            try:
+                await ensure_top_indicators(guild)
+                await ensure_invite_message(guild)
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                print(f"⚠️ Indicadores/invitación: {type(exc).__name__}: {exc}")
 
     if TWITCH_ENABLED:
         if not twitch_watch.is_running():
             twitch_watch.start()
-        if not twitch_clip_watch.is_running():
-            twitch_clip_watch.start()
-        print(
-            f"🟣 Twitch activo: @{TWITCH_CHANNEL} (directos cada {TWITCH_POLL_SECONDS}s; "
-            f"clips cada {TWITCH_CLIP_POLL_SECONDS}s)"
-        )
+        if not twitch_clips_watch.is_running():
+            twitch_clips_watch.start()
+        print(f"🟣 Twitch activo: @{TWITCH_CHANNEL} (cada {TWITCH_POLL_SECONDS}s)")
+        print(f"🎬 Clips automáticos activos (cada {TWITCH_CLIPS_POLL_SECONDS}s)")
     else:
         print("ℹ️ Twitch automático desactivado. Faltan: " + ", ".join(twitch_missing_config()))
 
@@ -2112,7 +2086,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
         return
 
-    guild, message, mapping = await get_reaction_panel_mapping(payload)
+    guild, message, mapping, exclusive = await get_reaction_panel_mapping(payload)
     if guild is None or message is None or mapping is None:
         return
 
@@ -2129,14 +2103,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if selected is None:
         return
 
-    panel_title = message.embeds[0].title if message.embeds else ""
-    exclusive = panel_title in EXCLUSIVE_REACTION_PANEL_TITLES
     group_role_names = set(mapping.values())
-    old_roles = (
-        [role for role in member.roles if role.name in group_role_names and role != selected]
-        if exclusive
-        else []
-    )
+    old_roles = [role for role in member.roles if role.name in group_role_names and role != selected] if exclusive else []
 
     try:
         if old_roles:
@@ -2146,7 +2114,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     except discord.Forbidden:
         return
 
-    # País, edad y rango son exclusivos. Juegos/plataformas/avisos permiten varias opciones.
+    # País, edad y rango son exclusivos; juegos/plataformas/avisos permiten varios.
     if exclusive:
         for reaction in message.reactions:
             reaction_emoji = str(reaction.emoji)
@@ -2162,7 +2130,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
         return
 
-    guild, _message, mapping = await get_reaction_panel_mapping(payload)
+    guild, _message, mapping, _exclusive = await get_reaction_panel_mapping(payload)
     if guild is None or mapping is None:
         return
 
@@ -2238,7 +2206,7 @@ async def setup_server(interaction: discord.Interaction):
 
         no_perms = discord.Permissions.none()
 
-        role_owner = await ensure_role(guild, ROLE_OWNER, owner_perms, 0xF1C40F, True)
+        role_owner = await ensure_role(guild, ROLE_OWNER, owner_perms, 0x000000, False)
         role_coowner = await ensure_role(guild, ROLE_COOWNER, coowner_perms, 0xE67E22, True)
         role_admin = await ensure_role(guild, ROLE_ADMIN, admin_perms, 0xE74C3C, True)
         role_mod = await ensure_role(guild, ROLE_MOD, mod_perms, 0x3498DB, True)
@@ -2250,11 +2218,9 @@ async def setup_server(interaction: discord.Interaction):
         await ensure_role(guild, ROLE_LIVE, no_perms, 0xED4245, True)
         await ensure_role(guild, ROLE_LIVE_NOTIFY, no_perms, 0x9146FF, False)
         await ensure_role(guild, ROLE_EVENT_NOTIFY, no_perms, 0xF1C40F, False)
-        await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xEB459E, False)
-        for name in GAME_ROLES:
-            await ensure_role(guild, name, no_perms, 0x5865F2, False)
-        for name in PLATFORM_ROLES:
-            await ensure_role(guild, name, no_perms, 0x99AAB5, False)
+        await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xFEE75C, False)
+        for role_name in (ROLE_GAME_VALORANT, ROLE_GAME_MINECRAFT, ROLE_GAME_OTHER, ROLE_PLATFORM_PC, ROLE_PLATFORM_CONSOLE, ROLE_PLATFORM_MOBILE):
+            await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
 
         # Roles visuales: 0 permisos.
         for name in AGE_ROLES:
@@ -2378,21 +2344,13 @@ async def setup_server(interaction: discord.Interaction):
             verification_overwrites,
             "Verificate para desbloquear el resto del servidor.",
         )
-        await ensure_member_counter_channel(guild, cat_info)
         ch_invite = await ensure_text_channel(
             guild,
             cat_info,
             CH_INVITE,
             public_readonly,
-            "Invitación oficial para compartir la comunidad.",
+            "Invitación oficial del servidor.",
         )
-        invite_url = await ensure_server_invite(guild, ch_verify)
-        await ensure_invite_panel(ch_invite, invite_url)
-        try:
-            await ch_invite.edit(position=1, reason="Mostrar invitación arriba")
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
         ch_rules = await ensure_text_channel(
             guild,
             cat_info,
@@ -2405,7 +2363,7 @@ async def setup_server(interaction: discord.Interaction):
             cat_info,
             CH_ROLES,
             roles_readonly,
-            "Reaccioná para elegir país, rango de edad y rango de Valorant.",
+            "Elegí país, edad, rango de Valorant, juegos, plataformas y avisos.",
         )
         ch_announcements = await ensure_text_channel(
             guild,
@@ -2469,9 +2427,11 @@ async def setup_server(interaction: discord.Interaction):
         ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
         ch_memes = await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
         ch_commands = await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
-        ch_clips = await ensure_text_channel(guild, cat_community, CH_CLIPS, member_text, "Clips nuevos de Twitch y momentos de la comunidad.")
-        ch_pets = await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de mascotas y animales.")
+        ch_clips = await ensure_text_channel(guild, cat_community, CH_CLIPS, member_readonly, "Clips nuevos de Twitch publicados automáticamente.")
+        ch_pets = await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de las mascotas de la comunidad.")
         ch_suggestions = await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_text, "Ideas y sugerencias para mejorar la comunidad.")
+        await ensure_top_indicators(guild)
+        await ensure_invite_message(guild)
 
         # ── Gaming ────────────────────────────────────────────────────────────
         ch_gaming = await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
@@ -2515,7 +2475,7 @@ async def setup_server(interaction: discord.Interaction):
                     if (
                         msg.author == guild.me
                         and msg.embeds
-                        and msg.embeds[0].title in {"🌎 Roles de perfil", "🎭 Elegí tus roles"}
+                        and msg.embeds[0].title in {"🌎 Roles de perfil", "🎭 Elegí tus roles", LEGACY_ROLE_PANEL_NOTIFY_TITLE}
                     ):
                         await msg.delete()
             except discord.Forbidden:
@@ -2567,8 +2527,13 @@ async def setup_server(interaction: discord.Interaction):
             rank_reaction_roles,
         )
 
+        game_lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in GAME_REACTION_ROLES.items())
+        await ensure_reaction_role_panel(ch_roles, ROLE_PANEL_GAMES_TITLE, "↳ **¿Qué juegos te interesan?** Podés elegir varios.\n\n" + game_lines, GAME_REACTION_ROLES)
+
+        platform_lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in PLATFORM_REACTION_ROLES.items())
+        await ensure_reaction_role_panel(ch_roles, ROLE_PANEL_PLATFORM_TITLE, "↳ **¿Dónde jugás?** Podés elegir varias plataformas.\n\n" + platform_lines, PLATFORM_REACTION_ROLES)
+
         await ensure_twitch_notify_panel(guild)
-        await ensure_extra_role_panels(guild, ch_roles)
 
         ticket_panel_already = False
         async for msg in ch_commands.history(limit=30):
@@ -2620,6 +2585,26 @@ async def setup_server(interaction: discord.Interaction):
             "Para buscar jugadores usá `🔎・busco-grupo` y para multimedia usá `📸・multimedia`.",
         )
         await ensure_guide(
+            ch_invite,
+            "Invitar amigos",
+            "Acá encontrás el enlace oficial para sumar amigos a la comunidad. El indicador `🔗 Invitar Amigos` de arriba es solo decorativo y permanece bloqueado.",
+        )
+        await ensure_guide(
+            ch_clips,
+            "Clips",
+            "Los clips nuevos creados en el Twitch de la streamer aparecen **automáticamente** acá. El canal es de solo lectura para mantenerlo ordenado.",
+        )
+        await ensure_guide(
+            ch_pets,
+            "Mascotas",
+            "🐾 El rincón para presumir gatos, perros, hámsters y cualquier compañero animal. Compartí fotos o videos con respeto y sin contenido desagradable.",
+        )
+        await ensure_guide(
+            ch_suggestions,
+            "Sugerencias",
+            "💡 Proponé ideas para el Discord, streams, eventos o juegos. Explicá tu idea con claridad y respetá las opiniones de los demás.",
+        )
+        await ensure_guide(
             ch_media,
             "Multimedia",
             "Compartí clips, capturas, fotos, fanarts y otro contenido multimedia. "
@@ -2635,24 +2620,6 @@ async def setup_server(interaction: discord.Interaction):
             "Comandos y soporte",
             "Usá este canal para las utilidades del bot. Si necesitás hablar en privado con el staff, "
             "usá el botón **Crear reporte** que aparece debajo.",
-        )
-        await ensure_guide(
-            ch_clips,
-            "Clips",
-            "🎬 Acá aparecen automáticamente los **clips nuevos del Twitch de s0ftbl4de**. "
-            "También podés compartir momentos relacionados con la comunidad. Mantené todo dentro de las reglas.",
-        )
-        await ensure_guide(
-            ch_pets,
-            "Mascotas",
-            "🐾 El rincón para presumir compañeros: gatos, perros, conejos, hámsters y demás animales. "
-            "Compartí fotos o videos propios y tratá con cariño el contenido de los demás.",
-        )
-        await ensure_guide(
-            ch_suggestions,
-            "Sugerencias",
-            "💡 ¿Tenés una idea para el Discord, los streams, eventos o juegos? Dejala acá de forma clara y respetuosa. "
-            "El staff puede leerlas aunque no todas puedan implementarse.",
         )
         await ensure_guide(
             ch_gaming,
@@ -2693,8 +2660,7 @@ async def setup_server(interaction: discord.Interaction):
         await interaction.followup.send(
             "✅ **Setup completado.**\n"
             "Creé/actualicé roles, categorías, canales, permisos, verificación, "
-            "reaction roles, guías, bienvenida, contador de miembros, invitación, clips de Twitch, mascotas, sugerencias, "
-            "el canal exclusivo de la streamer, reportes y la búsqueda de grupo de Valorant.\n\n"
+            "reaction roles, guías por canal, el canal exclusivo de la streamer, el sistema privado de reportes y la búsqueda de grupo de Valorant.\n\n"
             "No borré ningún canal ni rol que ya existiera.",
             ephemeral=True,
         )
@@ -2811,6 +2777,17 @@ async def update_channels_command(interaction: discord.Interaction):
         ),
     }
 
+
+    member_readonly = {
+        everyone: discord.PermissionOverwrite(view_channel=False),
+        role_member: discord.PermissionOverwrite(
+            view_channel=True, send_messages=False, add_reactions=True, read_message_history=True
+        ),
+        role_owner: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        role_coowner: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        role_admin: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+        role_mod: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+    }
     roles_readonly = {
         everyone: discord.PermissionOverwrite(view_channel=False),
         role_member: discord.PermissionOverwrite(
@@ -2847,17 +2824,10 @@ async def update_channels_command(interaction: discord.Interaction):
     await ensure_category(guild, CAT_TICKETS, staff_ow)
 
     await set_progress(interaction, "🔄 **Canales:** actualizando INFORMACIÓN...")
-    ch_verify = await ensure_text_channel(guild, cat_info, CH_VERIFY, verification_overwrites, "Verificate para desbloquear el resto del servidor.")
-    await ensure_member_counter_channel(guild, cat_info)
-    ch_invite = await ensure_text_channel(guild, cat_info, CH_INVITE, public_readonly, "Invitación oficial para compartir la comunidad.")
-    invite_url = await ensure_server_invite(guild, ch_verify)
-    await ensure_invite_panel(ch_invite, invite_url)
-    try:
-        await ch_invite.edit(position=1, reason="Mostrar invitación arriba")
-    except (discord.Forbidden, discord.HTTPException):
-        pass
+    await ensure_text_channel(guild, cat_info, CH_VERIFY, verification_overwrites, "Verificate para desbloquear el resto del servidor.")
+    await ensure_text_channel(guild, cat_info, CH_INVITE, public_readonly, "Invitación oficial del servidor.")
     await ensure_text_channel(guild, cat_info, CH_RULES, public_readonly, "Reglas y convivencia de la comunidad.")
-    await ensure_text_channel(guild, cat_info, CH_ROLES, roles_readonly, "Reaccioná para elegir país, rango de edad y rango de Valorant.")
+    await ensure_text_channel(guild, cat_info, CH_ROLES, roles_readonly, "Elegí país, edad, rango de Valorant, juegos, plataformas y avisos.")
     await ensure_text_channel(guild, cat_info, CH_ANNOUNCEMENTS, public_readonly, "Anuncios oficiales del servidor.")
 
     stream_ow = dict(public_readonly)
@@ -2908,9 +2878,11 @@ async def update_channels_command(interaction: discord.Interaction):
     await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
     await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
     await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
-    await ensure_text_channel(guild, cat_community, CH_CLIPS, member_text, "Clips nuevos de Twitch y momentos de la comunidad.")
-    await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de mascotas y animales.")
+    await ensure_text_channel(guild, cat_community, CH_CLIPS, member_readonly, "Clips nuevos de Twitch publicados automáticamente.")
+    await ensure_text_channel(guild, cat_community, CH_PETS, member_text, "Fotos y videos de las mascotas de la comunidad.")
     await ensure_text_channel(guild, cat_community, CH_SUGGESTIONS, member_text, "Ideas y sugerencias para mejorar la comunidad.")
+    await ensure_top_indicators(guild)
+    await ensure_invite_message(guild)
     await ensure_text_channel(guild, cat_gaming, CH_GAMING, member_text, "Juegos en general.")
     await ensure_text_channel(guild, cat_gaming, CH_VALORANT, member_text, "Todo sobre Valorant.")
     await ensure_text_channel(guild, cat_gaming, CH_LFG, member_text, "Buscá duo, team o gente para jugar.")
@@ -2927,11 +2899,11 @@ async def update_channels_command(interaction: discord.Interaction):
     await set_progress(
         interaction,
         "✅ **Canales y permisos actualizados.**\n"
-        "💜 También quedaron listos el contador, invitación, clips, mascotas, sugerencias y `aqui-solo-habla-la-streamer`.",
+        "💜 Quedaron listos los indicadores superiores, invitación, clips, mascotas, sugerencias y el canal exclusivo de la streamer.",
     )
 
 
-@bot.tree.command(name="actualizar-roles", description="Actualiza roles de perfil, juegos, plataformas y avisos.")
+@bot.tree.command(name="actualizar-roles", description="Actualiza perfil, juegos, plataformas y avisos.")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def update_roles_command(interaction: discord.Interaction):
@@ -2956,21 +2928,14 @@ async def update_roles_command(interaction: discord.Interaction):
     await ensure_twitch_roles(guild)
 
     no_perms = discord.Permissions.none()
-    for role_name in AGE_ROLES:
+    for role_name in (ROLE_EVENT_NOTIFY, ROLE_GIVEAWAY_NOTIFY, ROLE_GAME_VALORANT, ROLE_GAME_MINECRAFT, ROLE_GAME_OTHER, ROLE_PLATFORM_PC, ROLE_PLATFORM_CONSOLE, ROLE_PLATFORM_MOBILE):
         await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
-    await ensure_role(guild, ROLE_EVENT_NOTIFY, no_perms, 0xF1C40F, False)
-    await ensure_role(guild, ROLE_GIVEAWAY_NOTIFY, no_perms, 0xEB459E, False)
-    for role_name in GAME_ROLES:
-        await ensure_role(guild, role_name, no_perms, 0x5865F2, False)
-    for role_name in PLATFORM_ROLES:
+    for role_name in AGE_ROLES:
         await ensure_role(guild, role_name, no_perms, 0x99AAB5, False)
 
     # Verifica qué roles puede administrar antes de tocar los paneles.
     blocked_roles = []
-    for role_name in (
-        list(COUNTRIES) + list(AGE_ROLES) + list(VALORANT_RANKS) + list(GAME_ROLES) + list(PLATFORM_ROLES)
-        + [ROLE_LIVE, ROLE_LIVE_NOTIFY, ROLE_EVENT_NOTIFY, ROLE_GIVEAWAY_NOTIFY]
-    ):
+    for role_name in list(COUNTRIES) + list(AGE_ROLES) + list(VALORANT_RANKS) + list(GAME_REACTION_ROLES.values()) + list(PLATFORM_REACTION_ROLES.values()) + list(NOTIFY_REACTION_ROLES.values()) + [ROLE_LIVE]:
         role = find_role(guild, role_name)
         if role is not None and role >= bot_member.top_role:
             blocked_roles.append(role.name)
@@ -2992,17 +2957,14 @@ async def update_roles_command(interaction: discord.Interaction):
             continue
 
         title = msg.embeds[0].title
-        if title in {"🌎 Roles de perfil", "🎭 Elegí tus roles"}:
+        if title in {"🌎 Roles de perfil", "🎭 Elegí tus roles", LEGACY_ROLE_PANEL_NOTIFY_TITLE}:
             try:
                 await msg.delete()
             except discord.Forbidden:
                 pass
             continue
 
-        if title in {
-            ROLE_PANEL_COUNTRY_TITLE, ROLE_PANEL_AGE_TITLE, ROLE_PANEL_RANK_TITLE, ROLE_PANEL_NOTIFY_TITLE,
-            ROLE_PANEL_GAMES_TITLE, ROLE_PANEL_PLATFORM_TITLE, ROLE_PANEL_EXTRA_NOTIFY_TITLE,
-        }:
+        if title in {ROLE_PANEL_COUNTRY_TITLE, ROLE_PANEL_AGE_TITLE, ROLE_PANEL_RANK_TITLE, ROLE_PANEL_GAMES_TITLE, ROLE_PANEL_PLATFORM_TITLE, ROLE_PANEL_NOTIFY_TITLE}:
             if title in current_seen:
                 try:
                     await msg.delete()
@@ -3066,9 +3028,15 @@ async def update_roles_command(interaction: discord.Interaction):
         rank_reaction_roles,
     )
 
-    await set_progress(interaction, "🔄 **Roles:** actualizando juegos, plataformas y avisos...")
+    await set_progress(interaction, "🔄 **Roles:** actualizando juegos y plataformas...")
+    game_lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in GAME_REACTION_ROLES.items())
+    await ensure_reaction_role_panel(ch_roles, ROLE_PANEL_GAMES_TITLE, "↳ **Elegí los juegos que te interesan.** Podés marcar varios.\n\n" + game_lines, GAME_REACTION_ROLES)
+
+    platform_lines = "\n".join(role_panel_line(guild, emoji, role_name) for emoji, role_name in PLATFORM_REACTION_ROLES.items())
+    await ensure_reaction_role_panel(ch_roles, ROLE_PANEL_PLATFORM_TITLE, "↳ **Elegí dónde jugás.** Podés marcar varias plataformas.\n\n" + platform_lines, PLATFORM_REACTION_ROLES)
+
+    await set_progress(interaction, "🔄 **Roles:** actualizando avisos...")
     await ensure_twitch_notify_panel(guild)
-    await ensure_extra_role_panels(guild, ch_roles)
 
     if missing_custom:
         await set_progress(
@@ -3085,7 +3053,7 @@ async def update_roles_command(interaction: discord.Interaction):
             "🎂 Rangos de edad sincronizados.\n"
             "🎖️ Rangos de Valorant sincronizados con los emojis personalizados.\n"
             "🎮 Juegos y plataformas listos.\n"
-            "🔔 Avisos de directo, eventos y sorteos listos.",
+            "📣 Avisos de directos, eventos y sorteos listos.",
         )
 
 
@@ -3101,23 +3069,24 @@ async def update_guides_command(interaction: discord.Interaction):
     await set_progress(interaction, "🔄 **Guías:** preparando canales...")
 
     guides = [
-        (CH_RULES, "Reglas", "Este canal es de **solo lectura**. Acá se publican las normas oficiales de la comunidad. Leelas antes de participar y consultá al staff si alguna regla no queda clara."),
-        (CH_ANNOUNCEMENTS, "Anuncios", "Acá se publican novedades importantes del servidor, eventos, cambios y avisos del staff. Los miembros pueden leer, pero solo el staff publica."),
-        (CH_STREAMS, "Directos", "Historial de avisos automáticos de Twitch. Cuando la streamer entra en vivo, el bot publica título, categoría, miniatura y enlace; quienes tengan `🔔・Avisos de directo` reciben la mención."),
-        (CH_STREAMER_ONLY, "Aquí solo habla la streamer", "Este es el espacio personal de la streamer. La comunidad puede **leer y reaccionar**, pero solo el rol `🎥・Streamer` puede publicar mensajes, imágenes y enlaces."),
-        (CH_GENERAL, "General", "Chat principal de la comunidad. Hablá, conocé gente y compartí con respeto. Para buscar jugadores usá `🔎・busco-grupo` y para multimedia usá `📸・multimedia`."),
-        (CH_MEDIA, "Multimedia", "Compartí clips, capturas, fotos, fanarts y otro contenido multimedia. Evitá contenido NSFW, spam o material que incumpla las reglas."),
-        (CH_MEMES, "Memes", "Canal para memes y humor de la comunidad. Mantené el contenido dentro de las reglas y sin ataques personales."),
-        (CH_COMMANDS, "Comandos y soporte", "Usá este canal para las utilidades del bot. Si necesitás hablar en privado con el staff, usá el botón **Crear reporte**."),
-        (CH_CLIPS, "Clips", "🎬 Acá aparecen automáticamente los **clips nuevos del Twitch de s0ftbl4de**. También podés compartir momentos relacionados con la comunidad."),
-        (CH_PETS, "Mascotas", "🐾 Compartí fotos y videos de tus gatos, perros, conejos, hámsters o cualquier otro compañero. Solo contenido sano y respetuoso."),
-        (CH_SUGGESTIONS, "Sugerencias", "💡 Ideas para el Discord, los streams, eventos o juegos. Explicá tu propuesta de forma clara y respetuosa para que el staff pueda evaluarla."),
-        (CH_GAMING, "Gaming", "Charlá sobre cualquier juego: Minecraft, cooperativos, shooters, juegos de historia y más. Valorant tiene su canal propio para mantener todo ordenado."),
-        (CH_VALORANT, "Valorant", "Canal general de Valorant: rankeds, agentes, mapas, clips, estrategias y partidas. Para armar grupo usá `🔎・busco-grupo`."),
-        (CH_LFG, "Buscar grupo — Valorant", "Usá **`/party`** acá para crear una búsqueda. Elegís modo, cuántas personas faltan y servidor.\n\nEl bot toma tu rango desde `🎭・roles` y publica una tarjeta con **Unirme**, **Salir** y **Cerrar**."),
-        (CH_STAFF, "Staff", "Chat interno del equipo de moderación. Usalo para coordinar decisiones, consultas y organización del servidor."),
-        (CH_REPORTS, "Reportes", "Registro interno de tickets: el bot avisa acá cuando un miembro abre o cierra un reporte privado."),
-        (CH_LOGS, "Logs", "Registro automático del servidor: entradas, salidas, cambios de roles/apodos y cambios de canales/roles. Los logs de contenido de mensajes son opcionales."),
+        (CH_INVITE, "Invitar amigos", "Acá está la invitación oficial del servidor. El indicador `🔗 Invitar Amigos` de arriba es visual; el enlace clickeable está en este canal."),
+        (CH_RULES, "Reglas", "Este canal es de **solo lectura**. Acá se publican las normas oficiales de la comunidad. Leelas antes de participar."),
+        (CH_ANNOUNCEMENTS, "Anuncios", "Novedades importantes del servidor, eventos, cambios y avisos del staff. Los miembros leen; el staff publica."),
+        (CH_STREAMS, "Directos", "Historial de avisos automáticos de Twitch. Al prender stream se publica título, categoría, miniatura y enlace; `🔔・Avisos de directo` recibe la mención."),
+        (CH_STREAMER_ONLY, "Aquí solo habla la streamer", "Espacio personal de la streamer. La comunidad puede **leer y reaccionar**, pero solo `🎥・Streamer` publica."),
+        (CH_GENERAL, "General", "Chat principal de la comunidad. Hablá, conocé gente y compartí con respeto."),
+        (CH_MEDIA, "Multimedia", "Compartí capturas, fotos, fanarts y contenido multimedia. Los clips de Twitch tienen su canal automático `🎬・clips`."),
+        (CH_MEMES, "Memes", "Memes y humor de la comunidad dentro de las reglas y sin ataques personales."),
+        (CH_COMMANDS, "Comandos y soporte", "Utilidades del bot. Para hablar en privado con el staff usá **Crear reporte**."),
+        (CH_CLIPS, "Clips", "🎬 Los clips nuevos creados en el Twitch de la streamer aparecen **automáticamente** acá. Canal de solo lectura para mantenerlo ordenado."),
+        (CH_PETS, "Mascotas", "🐾 Compartí fotos y videos de gatos, perros, hámsters y cualquier compañero animal. Con cariño y sin contenido desagradable."),
+        (CH_SUGGESTIONS, "Sugerencias", "💡 Proponé ideas para el Discord, streams, eventos o juegos. Explicá tu idea con claridad y respetá las opiniones."),
+        (CH_GAMING, "Gaming", "Charlá sobre cualquier juego. Valorant tiene su canal propio."),
+        (CH_VALORANT, "Valorant", "Rankeds, agentes, mapas, estrategias y partidas. Para armar grupo usá `🔎・busco-grupo`."),
+        (CH_LFG, "Buscar grupo — Valorant", "Usá **`/party`** acá para crear una búsqueda. El bot toma tu rango y publica botones de **Unirme**, **Salir** y **Cerrar**."),
+        (CH_STAFF, "Staff", "Chat interno del equipo de moderación."),
+        (CH_REPORTS, "Reportes", "Registro interno de tickets abiertos/cerrados."),
+        (CH_LOGS, "Logs", "Registro automático de entradas, salidas, roles, apodos y cambios de canales/roles."),
     ]
 
     updated = 0
@@ -3242,6 +3211,12 @@ async def update_twitch_command(interaction: discord.Interaction):
 
     if not twitch_watch.is_running():
         twitch_watch.start()
+    if not twitch_clips_watch.is_running():
+        twitch_clips_watch.start()
+    try:
+        await publish_new_twitch_clips(guild)
+    except Exception as exc:
+        print(f"⚠️ Comprobación de clips: {type(exc).__name__}: {exc}")
 
     if stream is not None:
         await handle_twitch_online(guild, stream)
@@ -3301,7 +3276,8 @@ async def twitch_status_command(interaction: discord.Interaction):
         f"Canal de voz temporal: {'✅ existe' if live_voice else '— no existe'}",
         f"Rol EN DIRECTO: {'✅ activo' if role_active else '— inactivo'}",
         f"Modo de prueba: {'🧪 ACTIVO' if _twitch_test_mode else '— inactivo'}",
-        f"Chequeo: cada {TWITCH_POLL_SECONDS}s",
+        f"Chequeo del directo: cada {TWITCH_POLL_SECONDS}s",
+        f"Clips automáticos: {'✅ activos' if twitch_clips_watch.is_running() else '⚠️ detenidos'} (cada {TWITCH_CLIPS_POLL_SECONDS}s)",
     ]
     await set_progress(interaction, "\n".join(lines))
 
@@ -3526,7 +3502,7 @@ async def party_command(
     embed = discord.Embed(
         title="🔎 Buscando grupo — Valorant",
         description=(
-            f"**{interaction.user.display_name}** está buscando gente para jugar.\\n"
+            f"**{interaction.user.display_name}** está buscando gente para jugar.\n"
             "Tocá **Unirme** para sumarte."
         ),
         colour=discord.Colour.blurple(),
@@ -3537,7 +3513,7 @@ async def party_command(
     embed.add_field(name="🌐 Servidor", value=server_text, inline=True)
     embed.add_field(
         name="👥 Jugadores",
-        value=f"{interaction.user.mention}\\n\\n**1/{max_players}**",
+        value=f"{interaction.user.mention}\n\n**1/{max_players}**",
         inline=False,
     )
     embed.set_footer(text=f"party_owner:{interaction.user.id}|max:{max_players}|closed:0")
@@ -3554,24 +3530,24 @@ async def party_command(
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    schedule_member_counter_update(member.guild)
     await send_log(
         member.guild,
         "📥 Miembro entró",
         f"{member.mention} (`{member.id}`) se unió al servidor.",
         discord.Colour.green(),
     )
+    await update_member_counter(member.guild)
 
 
 @bot.event
 async def on_member_remove(member: discord.Member):
-    schedule_member_counter_update(member.guild)
     await send_log(
         member.guild,
         "📤 Miembro salió",
         f"**{discord.utils.escape_markdown(str(member))}** (`{member.id}`) salió del servidor.",
         discord.Colour.orange(),
     )
+    await update_member_counter(member.guild)
 
 
 @bot.event
