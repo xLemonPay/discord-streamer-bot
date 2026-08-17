@@ -23,85 +23,17 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import base64
 
           path = Path('bot.py')
           code = path.read_text(encoding='utf-8')
-
           start_marker = 'async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:'
           end_marker = '\n\nasync def update_member_counter'
           start = code.index(start_marker)
           end = code.index(end_marker, start)
-
-          replacement = '''async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:
-    """Crea/migra los indicadores dentro de la categoría CLAN KITEZH."""
-    overwrites = indicator_overwrites(guild)
-    wanted_count = member_counter_name(guild)
-
-    # El nombre visual puede tener espacios/emojis. Normalizamos para encontrar
-    # igualmente una categoría como "C L A N  K I T E Z H".
-    home_category = next(
-        (
-            category
-            for category in guild.categories
-            if "clan" in re.sub(r"[^a-z0-9]", "", category.name.lower())
-            and "kitezh" in re.sub(r"[^a-z0-9]", "", category.name.lower())
-        ),
-        None,
-    )
-
-    counter = find_member_counter_voice(guild)
-    if counter is None:
-        counter = await guild.create_voice_channel(
-            wanted_count,
-            category=home_category,
-            position=0,
-            overwrites=overwrites,
-            reason="Contador visual de miembros",
-        )
-    else:
-        edits = {}
-        if counter.name != wanted_count:
-            edits["name"] = wanted_count
-        wanted_category_id = home_category.id if home_category is not None else None
-        if counter.category_id != wanted_category_id:
-            edits["category"] = home_category
-        if counter.overwrites != overwrites:
-            edits["overwrites"] = overwrites
-        if edits:
-            await counter.edit(**edits, reason="Actualizar contador visual de miembros")
-
-    invite_indicator = find_voice(guild, VC_INVITE_INDICATOR)
-    if invite_indicator is None:
-        invite_indicator = next(
-            (vc for vc in guild.voice_channels if "invitar amigos" in vc.name.lower()),
-            None,
-        )
-    if invite_indicator is None:
-        invite_indicator = await guild.create_voice_channel(
-            VC_INVITE_INDICATOR,
-            category=home_category,
-            position=1,
-            overwrites=overwrites,
-            reason="Indicador visual de invitación",
-        )
-    else:
-        edits = {}
-        if invite_indicator.name != VC_INVITE_INDICATOR:
-            edits["name"] = VC_INVITE_INDICATOR
-        wanted_category_id = home_category.id if home_category is not None else None
-        if invite_indicator.category_id != wanted_category_id:
-            edits["category"] = home_category
-        if invite_indicator.overwrites != overwrites:
-            edits["overwrites"] = overwrites
-        if edits:
-            await invite_indicator.edit(**edits, reason="Actualizar indicador de invitación")
-
-    return counter, invite_indicator
-'''
-
+          replacement = base64.b64decode('YXN5bmMgZGVmIGVuc3VyZV90b3BfaW5kaWNhdG9ycyhndWlsZDogZGlzY29yZC5HdWlsZCkgLT4gdHVwbGVbZGlzY29yZC5Wb2ljZUNoYW5uZWwsIGRpc2NvcmQuVm9pY2VDaGFubmVsXToKICAgICIiIkNyZWEvbWlncmEgbG9zIGluZGljYWRvcmVzIGRlbnRybyBkZSBsYSBjYXRlZ29yw61hIENMQU4gS0lURVpILiIiIgogICAgb3ZlcndyaXRlcyA9IGluZGljYXRvcl9vdmVyd3JpdGVzKGd1aWxkKQogICAgd2FudGVkX2NvdW50ID0gbWVtYmVyX2NvdW50ZXJfbmFtZShndWlsZCkKCiAgICAjIEVsIG5vbWJyZSB2aXN1YWwgcHVlZGUgdGVuZXIgZXNwYWNpb3MvZW1vamlzLiBOb3JtYWxpemFtb3MgcGFyYSBlbmNvbnRyYXIKICAgICMgaWd1YWxtZW50ZSB1bmEgY2F0ZWdvcsOtYSBjb21vICJDIEwgQSBOICBLIEkgVCBFIFogSCIuCiAgICBob21lX2NhdGVnb3J5ID0gbmV4dCgKICAgICAgICAoCiAgICAgICAgICAgIGNhdGVnb3J5CiAgICAgICAgICAgIGZvciBjYXRlZ29yeSBpbiBndWlsZC5jYXRlZ29yaWVzCiAgICAgICAgICAgIGlmICJjbGFuIiBpbiByZS5zdWIociJbXmEtejAtOV0iLCAiIiwgY2F0ZWdvcnkubmFtZS5sb3dlcigpKQogICAgICAgICAgICBhbmQgImtpdGV6aCIgaW4gcmUuc3ViKHIiW15hLXowLTldIiwgIiIsIGNhdGVnb3J5Lm5hbWUubG93ZXIoKSkKICAgICAgICApLAogICAgICAgIE5vbmUsCiAgICApCgogICAgY291bnRlciA9IGZpbmRfbWVtYmVyX2NvdW50ZXJfdm9pY2UoZ3VpbGQpCiAgICBpZiBjb3VudGVyIGlzIE5vbmU6CiAgICAgICAgY291bnRlciA9IGF3YWl0IGd1aWxkLmNyZWF0ZV92b2ljZV9jaGFubmVsKAogICAgICAgICAgICB3YW50ZWRfY291bnQsCiAgICAgICAgICAgIGNhdGVnb3J5PWhvbWVfY2F0ZWdvcnksCiAgICAgICAgICAgIHBvc2l0aW9uPTAsCiAgICAgICAgICAgIG92ZXJ3cml0ZXM9b3ZlcndyaXRlcywKICAgICAgICAgICAgcmVhc29uPSJDb250YWRvciB2aXN1YWwgZGUgbWllbWJyb3MiLAogICAgICAgICkKICAgIGVsc2U6CiAgICAgICAgZWRpdHMgPSB7fQogICAgICAgIGlmIGNvdW50ZXIubmFtZSAhPSB3YW50ZWRfY291bnQ6CiAgICAgICAgICAgIGVkaXRzWyJuYW1lIl0gPSB3YW50ZWRfY291bnQKICAgICAgICB3YW50ZWRfY2F0ZWdvcnlfaWQgPSBob21lX2NhdGVnb3J5LmlkIGlmIGhvbWVfY2F0ZWdvcnkgaXMgbm90IE5vbmUgZWxzZSBOb25lCiAgICAgICAgaWYgY291bnRlci5jYXRlZ29yeV9pZCAhPSB3YW50ZWRfY2F0ZWdvcnlfaWQ6CiAgICAgICAgICAgIGVkaXRzWyJjYXRlZ29yeSJdID0gaG9tZV9jYXRlZ29yeQogICAgICAgIGlmIGNvdW50ZXIub3ZlcndyaXRlcyAhPSBvdmVyd3JpdGVzOgogICAgICAgICAgICBlZGl0c1sib3ZlcndyaXRlcyJdID0gb3ZlcndyaXRlcwogICAgICAgIGlmIGVkaXRzOgogICAgICAgICAgICBhd2FpdCBjb3VudGVyLmVkaXQoKiplZGl0cywgcmVhc29uPSJBY3R1YWxpemFyIGNvbnRhZG9yIHZpc3VhbCBkZSBtaWVtYnJvcyIpCgogICAgaW52aXRlX2luZGljYXRvciA9IGZpbmRfdm9pY2UoZ3VpbGQsIFZDX0lOVklURV9JTkRJQ0FUT1IpCiAgICBpZiBpbnZpdGVfaW5kaWNhdG9yIGlzIE5vbmU6CiAgICAgICAgaW52aXRlX2luZGljYXRvciA9IG5leHQoCiAgICAgICAgICAgICh2YyBmb3IgdmMgaW4gZ3VpbGQudm9pY2VfY2hhbm5lbHMgaWYgImludml0YXIgYW1pZ29zIiBpbiB2Yy5uYW1lLmxvd2VyKCkpLAogICAgICAgICAgICBOb25lLAogICAgICAgICkKICAgIGlmIGludml0ZV9pbmRpY2F0b3IgaXMgTm9uZToKICAgICAgICBpbnZpdGVfaW5kaWNhdG9yID0gYXdhaXQgZ3VpbGQuY3JlYXRlX3ZvaWNlX2NoYW5uZWwoCiAgICAgICAgICAgIFZDX0lOVklURV9JTkRJQ0FUT1IsCiAgICAgICAgICAgIGNhdGVnb3J5PWhvbWVfY2F0ZWdvcnksCiAgICAgICAgICAgIHBvc2l0aW9uPTEsCiAgICAgICAgICAgIG92ZXJ3cml0ZXM9b3ZlcndyaXRlcywKICAgICAgICAgICAgcmVhc29uPSJJbmRpY2Fkb3IgdmlzdWFsIGRlIGludml0YWNpw7NuIiwKICAgICAgICApCiAgICBlbHNlOgogICAgICAgIGVkaXRzID0ge30KICAgICAgICBpZiBpbnZpdGVfaW5kaWNhdG9yLm5hbWUgIT0gVkNfSU5WSVRFX0lORElDQVRPUjoKICAgICAgICAgICAgZWRpdHNbIm5hbWUiXSA9IFZDX0lOVklURV9JTkRJQ0FUT1IKICAgICAgICB3YW50ZWRfY2F0ZWdvcnlfaWQgPSBob21lX2NhdGVnb3J5LmlkIGlmIGhvbWVfY2F0ZWdvcnkgaXMgbm90IE5vbmUgZWxzZSBOb25lCiAgICAgICAgaWYgaW52aXRlX2luZGljYXRvci5jYXRlZ29yeV9pZCAhPSB3YW50ZWRfY2F0ZWdvcnlfaWQ6CiAgICAgICAgICAgIGVkaXRzWyJjYXRlZ29yeSJdID0gaG9tZV9jYXRlZ29yeQogICAgICAgIGlmIGludml0ZV9pbmRpY2F0b3Iub3ZlcndyaXRlcyAhPSBvdmVyd3JpdGVzOgogICAgICAgICAgICBlZGl0c1sib3ZlcndyaXRlcyJdID0gb3ZlcndyaXRlcwogICAgICAgIGlmIGVkaXRzOgogICAgICAgICAgICBhd2FpdCBpbnZpdGVfaW5kaWNhdG9yLmVkaXQoKiplZGl0cywgcmVhc29uPSJBY3R1YWxpemFyIGluZGljYWRvciBkZSBpbnZpdGFjacOzbiIpCgogICAgcmV0dXJuIGNvdW50ZXIsIGludml0ZV9pbmRpY2F0b3IK').decode('utf-8')
           code = code[:start] + replacement + code[end:]
 
-          # Comprobaciones del cambio anterior de bienvenidas: debe seguir presente.
           assert 'CH_WELCOME = "👋・bienvenidas"' in code
           assert 'find_text(member.guild, CH_WELCOME)' in code
           assert 'CH_WELCOME,\n        member_readonly' in code
