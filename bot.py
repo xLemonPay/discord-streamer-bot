@@ -986,6 +986,7 @@ CH_STREAMER_ONLY = "💜・aqui-solo-habla-la-streamer"
 CH_LIVE = "🔴・stream-en-vivo"
 
 CH_GENERAL = "💬・general"
+CH_WELCOME = "👋・bienvenidas"
 CH_MEDIA = "📸・multimedia"
 CH_MEMES = "😂・memes"
 CH_COMMANDS = "🤖・comandos"
@@ -1651,7 +1652,7 @@ async def send_report_staff(
 
 
 async def send_welcome(member: discord.Member) -> None:
-    channel = find_text(member.guild, CH_GENERAL)
+    channel = find_text(member.guild, CH_WELCOME)
     if channel is None:
         return
     count = member.guild.member_count if member.guild.member_count is not None else len(member.guild.members)
@@ -2457,7 +2458,7 @@ async def handle_starboard_reaction(payload: discord.RawReactionActionEvent) -> 
         return
     excluded = {
         CH_STARBOARD, CH_VERIFY, CH_ROLES, CH_RULES, CH_ANNOUNCEMENTS,
-        CH_STREAMS, CH_CLIPS, CH_COMMANDS, CH_SUGGESTIONS, CH_INVITE,
+        CH_STREAMS, CH_CLIPS, CH_COMMANDS, CH_SUGGESTIONS, CH_INVITE, CH_WELCOME,
         CH_EVENTS, CH_LOGS, CH_REPORTS, CH_STAFF,
     }
     if channel.name in excluded or (channel.category and channel.category.name == CAT_TICKETS):
@@ -3241,6 +3242,13 @@ async def setup_server(interaction: discord.Interaction):
 
         # ── Comunidad ─────────────────────────────────────────────────────────
         ch_general = await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
+        ch_welcome = await ensure_text_channel(
+            guild,
+            cat_community,
+            CH_WELCOME,
+            member_readonly,
+            "Bienvenidas automáticas a nuevos miembros verificados.",
+        )
         ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
         ch_memes = await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
         ch_commands = await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
@@ -3705,6 +3713,13 @@ async def update_channels_command(interaction: discord.Interaction):
 
     await set_progress(interaction, "🔄 **Canales:** actualizando COMUNIDAD y GAMING...")
     await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")
+    await ensure_text_channel(
+        guild,
+        cat_community,
+        CH_WELCOME,
+        member_readonly,
+        "Bienvenidas automáticas a nuevos miembros verificados.",
+    )
     await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")
     await ensure_text_channel(guild, cat_community, CH_MEMES, member_text, "Memes de la comunidad.")
     await ensure_text_channel(guild, cat_community, CH_COMMANDS, member_text, "Comandos, soporte y utilidades del bot.")
