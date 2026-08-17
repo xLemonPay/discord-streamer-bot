@@ -1,0 +1,69 @@
+name: Apply dedicated welcome channel
+
+on:
+  push:
+    paths:
+      - ".github/workflows/apply-welcome-channel.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Streamer Bot welcome channel
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("bot.py")
+          text = path.read_text(encoding="utf-8")
+
+          replacements = [
+              (
+                  'CH_GENERAL = "💬・general"\nCH_MEDIA = "📸・multimedia"',
+                  'CH_GENERAL = "💬・general"\nCH_WELCOME = "👋・bienvenidas"\nCH_MEDIA = "📸・multimedia"',
+              ),
+              (
+                  'async def send_welcome(member: discord.Member) -> None:\n    channel = find_text(member.guild, CH_GENERAL)',
+                  'async def send_welcome(member: discord.Member) -> None:\n    channel = find_text(member.guild, CH_WELCOME)',
+              ),
+              (
+                  '        ch_general = await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")\n        ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")',
+                  '        ch_general = await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")\n        ch_welcome = await ensure_text_channel(\n            guild,\n            cat_community,\n            CH_WELCOME,\n            member_readonly,\n            "Bienvenidas automáticas a nuevos miembros verificados.",\n        )\n        ch_media = await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")',
+              ),
+              (
+                  '    await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")\n    await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")',
+                  '    await ensure_text_channel(guild, cat_community, CH_GENERAL, member_text, "Chat principal.")\n    await ensure_text_channel(\n        guild,\n        cat_community,\n        CH_WELCOME,\n        member_readonly,\n        "Bienvenidas automáticas a nuevos miembros verificados.",\n    )\n    await ensure_text_channel(guild, cat_community, CH_MEDIA, member_text, "Fotos, clips y contenido multimedia.")',
+              ),
+              (
+                  '        CH_STREAMS, CH_CLIPS, CH_COMMANDS, CH_SUGGESTIONS, CH_INVITE,\n        CH_EVENTS, CH_LOGS, CH_REPORTS, CH_STAFF,',
+                  '        CH_STREAMS, CH_CLIPS, CH_COMMANDS, CH_SUGGESTIONS, CH_INVITE, CH_WELCOME,\n        CH_EVENTS, CH_LOGS, CH_REPORTS, CH_STAFF,',
+              ),
+          ]
+
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f"No encontré el bloque esperado para aplicar el cambio: {old[:80]!r}")
+              text = text.replace(old, new, 1)
+
+          path.write_text(text, encoding="utf-8")
+          PY
+
+      - name: Validate Python syntax
+        run: python -m py_compile bot.py
+
+      - name: Commit update and remove temporary workflow
+        shell: bash
+        run: |
+          git config user.name "xLemonPay Bot Update"
+          git config user.email "actions@users.noreply.github.com"
+          git add bot.py
+          git rm .github/workflows/apply-welcome-channel.yml
+          git commit -m "Move welcome messages to dedicated channel"
+          git push
