@@ -1202,15 +1202,27 @@ def indicator_overwrites(guild: discord.Guild) -> dict:
 
 
 async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:
-    """Crea/migra los indicadores. Si ya están bien, no los vuelve a mover."""
+    """Crea/migra los indicadores dentro de la categoría CLAN KITEZH."""
     overwrites = indicator_overwrites(guild)
     wanted_count = member_counter_name(guild)
+
+    # El nombre visual puede tener espacios/emojis. Normalizamos para encontrar
+    # igualmente una categoría como "C L A N  K I T E Z H".
+    home_category = next(
+        (
+            category
+            for category in guild.categories
+            if "clan" in re.sub(r"[^a-z0-9]", "", category.name.lower())
+            and "kitezh" in re.sub(r"[^a-z0-9]", "", category.name.lower())
+        ),
+        None,
+    )
 
     counter = find_member_counter_voice(guild)
     if counter is None:
         counter = await guild.create_voice_channel(
             wanted_count,
-            category=None,
+            category=home_category,
             position=0,
             overwrites=overwrites,
             reason="Contador visual de miembros",
@@ -1219,8 +1231,9 @@ async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChan
         edits = {}
         if counter.name != wanted_count:
             edits["name"] = wanted_count
-        if counter.category is not None:
-            edits["category"] = None
+        wanted_category_id = home_category.id if home_category is not None else None
+        if counter.category_id != wanted_category_id:
+            edits["category"] = home_category
         if counter.overwrites != overwrites:
             edits["overwrites"] = overwrites
         if edits:
@@ -1235,7 +1248,7 @@ async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChan
     if invite_indicator is None:
         invite_indicator = await guild.create_voice_channel(
             VC_INVITE_INDICATOR,
-            category=None,
+            category=home_category,
             position=1,
             overwrites=overwrites,
             reason="Indicador visual de invitación",
@@ -1244,8 +1257,9 @@ async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChan
         edits = {}
         if invite_indicator.name != VC_INVITE_INDICATOR:
             edits["name"] = VC_INVITE_INDICATOR
-        if invite_indicator.category is not None:
-            edits["category"] = None
+        wanted_category_id = home_category.id if home_category is not None else None
+        if invite_indicator.category_id != wanted_category_id:
+            edits["category"] = home_category
         if invite_indicator.overwrites != overwrites:
             edits["overwrites"] = overwrites
         if edits:
