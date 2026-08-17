@@ -1,0 +1,126 @@
+name: Apply Clan KITEZH indicator layout
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-home-indicators.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message != 'Remove one-off workflow'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Update Streamer Bot layout
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('bot.py')
+          code = path.read_text(encoding='utf-8')
+
+          start_marker = 'async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:'
+          end_marker = '\n\nasync def update_member_counter'
+          start = code.index(start_marker)
+          end = code.index(end_marker, start)
+
+          replacement = '''async def ensure_top_indicators(guild: discord.Guild) -> tuple[discord.VoiceChannel, discord.VoiceChannel]:
+    """Crea/migra los indicadores dentro de la categoría CLAN KITEZH."""
+    overwrites = indicator_overwrites(guild)
+    wanted_count = member_counter_name(guild)
+
+    # El nombre visual puede tener espacios/emojis. Normalizamos para encontrar
+    # igualmente una categoría como "C L A N  K I T E Z H".
+    home_category = next(
+        (
+            category
+            for category in guild.categories
+            if "clan" in re.sub(r"[^a-z0-9]", "", category.name.lower())
+            and "kitezh" in re.sub(r"[^a-z0-9]", "", category.name.lower())
+        ),
+        None,
+    )
+
+    counter = find_member_counter_voice(guild)
+    if counter is None:
+        counter = await guild.create_voice_channel(
+            wanted_count,
+            category=home_category,
+            position=0,
+            overwrites=overwrites,
+            reason="Contador visual de miembros",
+        )
+    else:
+        edits = {}
+        if counter.name != wanted_count:
+            edits["name"] = wanted_count
+        wanted_category_id = home_category.id if home_category is not None else None
+        if counter.category_id != wanted_category_id:
+            edits["category"] = home_category
+        if counter.overwrites != overwrites:
+            edits["overwrites"] = overwrites
+        if edits:
+            await counter.edit(**edits, reason="Actualizar contador visual de miembros")
+
+    invite_indicator = find_voice(guild, VC_INVITE_INDICATOR)
+    if invite_indicator is None:
+        invite_indicator = next(
+            (vc for vc in guild.voice_channels if "invitar amigos" in vc.name.lower()),
+            None,
+        )
+    if invite_indicator is None:
+        invite_indicator = await guild.create_voice_channel(
+            VC_INVITE_INDICATOR,
+            category=home_category,
+            position=1,
+            overwrites=overwrites,
+            reason="Indicador visual de invitación",
+        )
+    else:
+        edits = {}
+        if invite_indicator.name != VC_INVITE_INDICATOR:
+            edits["name"] = VC_INVITE_INDICATOR
+        wanted_category_id = home_category.id if home_category is not None else None
+        if invite_indicator.category_id != wanted_category_id:
+            edits["category"] = home_category
+        if invite_indicator.overwrites != overwrites:
+            edits["overwrites"] = overwrites
+        if edits:
+            await invite_indicator.edit(**edits, reason="Actualizar indicador de invitación")
+
+    return counter, invite_indicator
+'''
+
+          code = code[:start] + replacement + code[end:]
+
+          # Comprobaciones del cambio anterior de bienvenidas: debe seguir presente.
+          assert 'CH_WELCOME = "👋・bienvenidas"' in code
+          assert 'find_text(member.guild, CH_WELCOME)' in code
+          assert 'CH_WELCOME,\n        member_readonly' in code
+
+          path.write_text(code, encoding='utf-8')
+          PY
+
+      - name: Validate Python
+        run: python -m py_compile bot.py
+
+      - name: Commit change
+        shell: bash
+        run: |
+          git config user.name "xLemonPay"
+          git config user.email "109448695+xLemonPay@users.noreply.github.com"
+          git add bot.py
+          if git diff --cached --quiet; then
+            echo "No changes needed"
+            exit 0
+          fi
+          git commit -m "Move member indicators under Clan KITEZH"
+          git push
